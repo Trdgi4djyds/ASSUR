@@ -1,7 +1,7 @@
 
   # IPPOO ASSURANCE
 
-  This is a code bundle for IPPOO ASSURANCE. The original project is available at https://www.figma.com/design/P015Tob0QvDy4cvH8HmyXz/IPPOO-ASSURANCE.
+  This is the codebase for IPPOO ASSURANCE.
 
   ## Running the code
 
