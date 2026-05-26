@@ -1,3 +1,15 @@
+import product1 from "../../assets/images/products/product-1.jpg";
+import product2 from "../../assets/images/products/product-2.jpg";
+import product3 from "../../assets/images/products/product-3.jpg";
+import product4 from "../../assets/images/products/product-4.jpg";
+import product5 from "../../assets/images/products/product-5.jpg";
+import product6 from "../../assets/images/products/product-6.jpg";
+import product7 from "../../assets/images/products/product-7.jpg";
+import product8 from "../../assets/images/products/product-8.jpg";
+import product9 from "../../assets/images/products/product-9.jpg";
+import product10 from "../../assets/images/products/product-10.jpg";
+import product11 from "../../assets/images/products/product-11.jpg";
+
 export interface Product {
   id: string;
   slug: string;
@@ -33,7 +45,7 @@ export const products: Product[] = [
     icon: "Heart",
     color: "var(--ippoo-red)",
     colorLight: "var(--ippoo-red-light)",
-    image: "https://images.unsplash.com/photo-1576669801945-7a346954da5a?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwbWVkaWNhbCUyMGNvbnN1bHRhdGlvbiUyMGhlYWx0aGNhcmV8ZW58MXx8fHwxNzcxMjY5MTYyfDA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product1,
     shortDescription: "Une couverture santé pensée pour les travailleurs de l'informel : prise en charge des consultations, des médicaments essentiels et d'une partie des frais d'hospitalisation, avec un accompagnement préventif au plus près de votre quotidien.",
     hero: {
       title: "Micro-Assurance Santé et Maladie",
@@ -71,7 +83,7 @@ export const products: Product[] = [
     icon: "Package",
     color: "var(--ippoo-orange)",
     colorLight: "var(--ippoo-orange-light)",
-    image: "https://images.unsplash.com/photo-1760726743536-019e9e2b06b8?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwbWFya2V0JTIwc3RhbGwlMjBtZXJjaGFuZGlzZSUyMGdvb2RzfGVufDF8fHx8MTc3MTI2OTE2Mnww&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product2,
     shortDescription: "Une protection ciblée pour les commerçants et vendeurs dont le stock constitue la principale source de revenus : vol, incendie, inondations saisonnières et détériorations naturelles sont couverts pour que vous puissiez reprendre l'activité sans repartir de zéro.",
     hero: {
       title: "Micro-Assurance Spécifique pour Marchandises",
@@ -105,7 +117,7 @@ export const products: Product[] = [
     icon: "Wrench",
     color: "var(--ippoo-blue)",
     colorLight: "var(--ippoo-blue-light)",
-    image: "https://images.unsplash.com/photo-1721508490084-1b1de5b230d4?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwYXJ0aXNhbiUyMGNyYWZ0c21hbiUyMHdvcmtzaG9wJTIwdG9vbHN8ZW58MXx8fHwxNzcxMjY5MTYzfDA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product3,
     shortDescription: "Une couverture dédiée aux artisans et travailleurs indépendants : protégez vos outils contre le vol, la casse accidentelle et l'usure liée à un usage intensif, et bénéficiez d'un appui rapide pour la réparation ou le remplacement afin de limiter les jours d'arrêt.",
     hero: {
       title: "Micro-Assurance Équipement et Outillage",
@@ -135,7 +147,7 @@ export const products: Product[] = [
     icon: "Truck",
     color: "var(--ippoo-blue)",
     colorLight: "var(--ippoo-blue-light)",
-    image: "https://images.unsplash.com/photo-1766087124181-0677409b73eb?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxtb3RvcmN5Y2xlJTIwdGF4aSUyMHRyYW5zcG9ydCUyMGFmcmljYXxlbnwxfHx8fDE3NzEyNjkxNjN8MA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product4,
     shortDescription: "Une protection adaptée aux taxieurs, livreurs et conducteurs indépendants : motos, tricycles, charrettes ou vélos sont couverts contre les accidents légers, le vol et les pannes mécaniques, avec une assistance réactive pour reprendre la route au plus vite.",
     hero: {
       title: "Micro-Assurance Transport",
@@ -165,7 +177,7 @@ export const products: Product[] = [
     icon: "Baby",
     color: "var(--ippoo-red)",
     colorLight: "var(--ippoo-red-light)",
-    image: "https://images.unsplash.com/photo-1644222736030-f2ee4b799d36?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwcHJlZ25hbnQlMjB3b21hbiUyMG1hdGVybml0eXxlbnwxfHx8fDE3NzEyNjc3OTZ8MA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product5,
     shortDescription: "Un accompagnement complet de la grossesse à l'arrivée du bébé : consultations prénatales, accouchement sécurisé en centre partenaire, suivi post-partum et kit bébé pour les premiers jours, afin que la maternité reste un moment de joie et non une charge financière.",
     hero: {
       title: "Micro-Assurance Maternité",
@@ -199,7 +211,7 @@ export const products: Product[] = [
     icon: "GraduationCap",
     color: "var(--ippoo-orange)",
     colorLight: "var(--ippoo-orange-light)",
-    image: "https://images.unsplash.com/photo-1666281269793-da06484657e8?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwc2Nob29sJTIwY2hpbGRyZW4lMjBlZHVjYXRpb258ZW58MXx8fHwxNzcxMjIyMDYyfDA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product6,
     shortDescription: "Une protection conçue pour sécuriser la scolarité des enfants : prise en charge d'une partie des fournitures, des uniformes et des frais d'inscription, afin qu'un creux de trésorerie n'interrompe jamais leur parcours.",
     hero: {
       title: "Micro-Assurance Éducation",
@@ -229,7 +241,7 @@ export const products: Product[] = [
     icon: "Landmark",
     color: "var(--ippoo-green)",
     colorLight: "var(--ippoo-green-light)",
-    image: "https://images.unsplash.com/photo-1718010588689-9806ce642d39?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwc2VuaW9yJTIwZWxkZXJseSUyMHJldGlyZW1lbnR8ZW58MXx8fHwxNzcxMjY5MTY0fDA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product7,
     shortDescription: "Une solution d'épargne longue durée pensée pour les travailleurs sans régime formel : constituez un capital à votre rythme, qui se transformera en revenu régulier au moment de la retraite et protégera votre autonomie.",
     hero: {
       title: "Micro-Assurance Retraite et Prévoyance Vieillesse",
@@ -263,7 +275,7 @@ export const products: Product[] = [
     icon: "Shield",
     color: "var(--ippoo-green)",
     colorLight: "var(--ippoo-green-light)",
-    image: "https://images.unsplash.com/photo-1728957422037-eafc47af6f18?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwZmFtaWx5JTIwY29tbXVuaXR5JTIwc29saWRhcml0eXxlbnwxfHx8fDE3NzEyNjkxNjV8MA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product8,
     shortDescription: "Une double protection au cœur de la vie communautaire : indemnité funéraire mobilisable rapidement en cas de décès ou d'invalidité, et responsabilité civile pour couvrir les dommages involontaires causés dans le cadre de votre activité.",
     hero: {
       title: "Micro-Assurance Sociale et Responsabilité Civile",
@@ -297,7 +309,7 @@ export const products: Product[] = [
     icon: "Scale",
     color: "var(--ippoo-blue)",
     colorLight: "var(--ippoo-blue-light)",
-    image: "https://images.unsplash.com/photo-1759493701876-216808395fa9?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxsZWdhbCUyMGp1c3RpY2UlMjBjb25zdWx0YXRpb24lMjBhZnJpY2F8ZW58MXx8fHwxNzcxMjY5MTY1fDA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product9,
     shortDescription: "Un accès simplifié au conseil juridique : avocats partenaires habitués au terrain, orientation rapide sur vos droits, et prise en charge possible des frais essentiels pour résoudre les petits litiges qui menacent votre activité.",
     hero: {
       title: "Micro-Assurance Juridique",
@@ -331,7 +343,7 @@ export const products: Product[] = [
     icon: "Calculator",
     color: "var(--ippoo-orange)",
     colorLight: "var(--ippoo-orange-light)",
-    image: "https://images.unsplash.com/photo-1579940905965-a397bd496fd5?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhY2NvdW50aW5nJTIwYm9va2tlZXBpbmclMjBzbWFsbCUyMGJ1c2luZXNzJTIwYWZyaWNhfGVufDF8fHx8MTc3MTI2OTE2Nnww&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product10,
     shortDescription: "Un accompagnement comptable et fiscal simplifié pour les entrepreneurs informels : organisation des recettes et dépenses, conseils personnalisés sur vos obligations locales, et appui aux déclarations pour éviter les erreurs et les amendes.",
     hero: {
       title: "Micro-Assurance Comptable et Fiscale",
@@ -365,7 +377,7 @@ export const products: Product[] = [
     icon: "FileText",
     color: "var(--ippoo-green)",
     colorLight: "var(--ippoo-green-light)",
-    image: "https://images.unsplash.com/photo-1768875820800-1c2a6f2e8280?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZG1pbmlzdHJhdGl2ZSUyMGRvY3VtZW50cyUyMHBhcGVyd29yayUyMG9mZmljZXxlbnwxfHx8fDE3NzEyNjkxNjZ8MA&ixlib=rb-4.1.0&q=80&w=1080",
+    image: product11,
     shortDescription: "Un appui de terrain pour vos démarches administratives : renouvellement de pièces, dossiers de domiciliation, autorisations professionnelles vous êtes guidé pas à pas pour réduire les blocages, les allers-retours et les délais.",
     hero: {
       title: "Micro-Assurance Administrative",

@@ -8,7 +8,8 @@ import { ImageWithFallback } from "./figma/ImageWithFallback";
 import { usePageMeta } from "../lib/usePageMeta";
 import { useLang } from "../lib/LanguageContext";
 
-const heroImg = "https://images.unsplash.com/photo-1663250934966-916a88f543e5?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3Nzg4Nzd8MHwxfHNlYXJjaHwxfHxhZnJpY2FuJTIwYnVzaW5lc3MlMjB0ZWFtJTIwb2ZmaWNlJTIwYWJpZGphbnxlbnwxfHx8fDE3Nzk1NjcxNjd8MA&ixlib=rb-4.1.0&q=80&w=1080";
+import heroImgImport from "../../assets/images/about/hero.jpg";
+const heroImg = heroImgImport;
 import missionImg from "../../imports/t_l_chargement_-_2026-02-17T085009.981.jpg";
 
 const stats = [

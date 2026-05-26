@@ -8,6 +8,7 @@ import {
 import { useAuth } from "./AuthContext";
 import { useTheme } from "./ThemeContext";
 import { CommandPalette, useCommandPalette } from "./CommandPalette";
+import appShellBg from "../../assets/images/espace-client/appshell-bg.jpg";
 
 const RAIL = [
   { to: "/espace-client", end: true, label: "Accueil", icon: LayoutDashboard },
@@ -198,7 +199,7 @@ export function PageHeader({
               aria-hidden
               className="absolute inset-0 pointer-events-none"
               style={{
-                backgroundImage: "url('https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e?auto=format&fit=crop&w=1200&q=60')",
+                backgroundImage: `url(${appShellBg})`,
                 backgroundSize: "cover",
                 backgroundPosition: "center",
                 opacity: 0.18,

@@ -25,14 +25,14 @@ import mosaic1 from "../../imports/photo_8_2026-05-08_00-42-28-1.jpg";
 import mosaic2 from "../../imports/photo_9_2026-05-08_00-42-28.jpg";
 import mosaic3 from "../../imports/photo_14_2026-04-30_21-36-08-1.jpg";
 import mosaic4 from "../../imports/photo_15_2026-04-30_21-36-08-1.jpg";
+import heroStackAImg from "../../assets/images/home/hero-placeholder.jpg";
 
 const iconMap: Record<string, LucideIcon> = {
   Heart, Package, Wrench, Truck, Baby, GraduationCap, Landmark, Shield, Scale, Calculator, FileText,
 };
 
 const heroImage = heroPhoto;
-const heroStackA =
-  "https://images.unsplash.com/photo-1611432579402-7037e3e2c1e4?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&w=600&q=80";
+const heroStackA = heroStackAImg;
 const heroStackB = heroStackBImg;
 
 const mosaic = [mosaic1, mosaic2, mosaic3, mosaic4];
