@@ -8,7 +8,6 @@ import {
   generateAuthenticationOptions,
   verifyAuthenticationResponse,
 } from "npm:@simplewebauthn/server@10";
-import * as kv from "./kv_store.tsx";
 import {
   parseBody,
   SignupSchema, ProfileUpdateSchema, ClaimCreateSchema, PaymentLegacySchema,
@@ -40,10 +39,9 @@ const admin = createClient(
   Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
 );
 
-// Realtime broadcast helper (server -> client) via Supabase Broadcast REST.
-// Used to push chat events instantly without client polling.
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
 async function broadcast(topic: string, event: string, payload: unknown) {
   try {
     const res = await fetch(`${SUPABASE_URL}/realtime/v1/api/broadcast`, {
@@ -78,10 +76,6 @@ async function broadcast(topic: string, event: string, payload: unknown) {
   }
 })();
 
-// Admin auth is COMPLETELY SEPARATE from user auth. Credentials live in
-// env vars (ADMIN_USERNAME / ADMIN_PASSWORD). Successful login returns an
-// HMAC-signed token sent back in the X-Admin-Token header. Admin identity
-// is NEVER tied to the Supabase users table — strict isolation by design.
 const ADMIN_USERNAME = (Deno.env.get("ADMIN_USERNAME") ?? "").trim();
 const ADMIN_PASSWORD = (Deno.env.get("ADMIN_PASSWORD") ?? "").trim();
 const ADMIN_TOKEN_TTL_SEC = 60 * 60 * 8; // 8h
@@ -92,12 +86,10 @@ async function requireAdminToken(c: any) {
   const payload = await verifyToken<{ kind: string; username: string; exp: number }>(token);
   if (!payload || payload.kind !== "admin") return { admin: null, error: "invalid-admin-token", status: 401 as const };
   if (Date.now() / 1000 > payload.exp) return { admin: null, error: "expired-admin-token", status: 401 as const };
-  return { admin: { username: payload.username }, error: null, status: 200 as const };
+  return { admin: { username: payload.username }, error: null, status: 200 as const, ok: true };
 }
 
 async function requireUser(c: any) {
-  // Prefer X-User-Token (set by client) so the platform-level Authorization
-  // header can stay as the anon key (required when asymmetric JWTs are on).
   const userToken =
     c.req.header("X-User-Token") ??
     c.req.header("x-user-token") ??
@@ -108,35 +100,7 @@ async function requireUser(c: any) {
   return { user: data.user, error: null };
 }
 
-const k = {
-  profile: (uid: string) => `profile:${uid}`,
-  contracts: (uid: string) => `contracts:${uid}`,
-  claims: (uid: string) => `claims:${uid}`,
-  payments: (uid: string) => `payments:${uid}`,
-  beneficiaries: (uid: string) => `beneficiaries:${uid}`,
-  documents: (uid: string) => `documents:${uid}`,
-  notifications: (uid: string) => `notifications:${uid}`,
-  messages: (uid: string) => `messages:${uid}`,
-  settings: (uid: string) => `settings:${uid}`,
-  audit: (uid: string) => `audit:${uid}`,
-  rate: (key: string) => `rate:${key}`,
-  referralCode: (uid: string) => `referral:code:${uid}`,
-  referralByCode: (code: string) => `referral:bycode:${code}`,
-  referralRedemptions: (uid: string) => `referral:redemptions:${uid}`,
-  accountDeletion: (uid: string) => `account:deletion:${uid}`,
-  memberByNumber: (mn: string) => `member:bynum:${mn}`,
-  conversationMeta: (uid: string) => `conv:meta:${uid}`,
-  emailToUid: (email: string) => `email:${email.toLowerCase()}`,
-  webauthnCreds: (uid: string) => `webauthn:creds:${uid}`,
-  webauthnChallenge: (key: string) => `webauthn:chal:${key}`,
-  hmacSecret: () => `system:hmac:secret`,
-  promos: () => `system:promos`,
-  partners: () => `system:partners`,
-  site: () => `system:site`,
-  pushSubs: (uid: string) => `push:subs:${uid}`,
-};
-
-// --- HMAC signing for QR tokens ---
+// --- HMAC signing for QR tokens & Admin tokens ---
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 function b64urlEncode(bytes: Uint8Array | ArrayBuffer): string {
@@ -153,12 +117,13 @@ function b64urlDecode(s: string): Uint8Array {
 let cachedHmacKey: CryptoKey | null = null;
 async function getHmacKey(): Promise<CryptoKey> {
   if (cachedHmacKey) return cachedHmacKey;
-  let secret = await kv.get(k.hmacSecret());
+  const { data } = await admin.from("hmac_secrets").select("value").eq("key", "system:hmac:secret").maybeSingle();
+  let secret = data?.value;
   if (!secret) {
     const buf = new Uint8Array(32);
     crypto.getRandomValues(buf);
     secret = b64urlEncode(buf);
-    await kv.set(k.hmacSecret(), secret);
+    await admin.from("hmac_secrets").upsert({ key: "system:hmac:secret", value: secret });
   }
   cachedHmacKey = await crypto.subtle.importKey(
     "raw", b64urlDecode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"],
@@ -195,8 +160,9 @@ function randomMemberNumber(): string {
 async function assignMemberNumber(uid: string): Promise<string> {
   for (let i = 0; i < 12; i++) {
     const candidate = randomMemberNumber();
-    if (!(await kv.get(k.memberByNumber(candidate)))) {
-      await kv.set(k.memberByNumber(candidate), uid);
+    const { data } = await admin.from("profiles").select("id").eq("member_number", candidate).maybeSingle();
+    if (!data) {
+      await admin.from("profiles").update({ member_number: candidate }).eq("id", uid);
       return candidate;
     }
   }
@@ -217,43 +183,30 @@ function webauthnContext(c: any) {
   return { origin, rpID };
 }
 
-async function audit(uid: string, action: string, meta: Record<string, any> = {}) {
+async function auditLog(uid: string, action: string, meta: Record<string, any> = {}) {
   try {
-    const list = (await kv.get(k.audit(uid))) ?? [];
-    list.unshift({
-      id: `a_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      action,
-      meta,
-      at: new Date().toISOString(),
-    });
-    await kv.set(k.audit(uid), list.slice(0, 200));
+    await admin.from("audit_log").insert({ user_id: uid, action, meta });
   } catch (err) {
     console.log(`Audit log error for ${uid}/${action}: ${err}`);
   }
 }
 
-// Returns true when allowed; false when over limit. Window is rolling N seconds.
+// Rate limiting using system_config table (JSON-based rolling window)
 async function rateLimit(key: string, max: number, windowSec: number): Promise<boolean> {
   const now = Date.now();
-  const existing = (await kv.get(k.rate(key))) ?? { count: 0, resetAt: now + windowSec * 1000 };
+  const { data } = await admin.from("system_config").select("value").eq("key", `rate:${key}`).maybeSingle();
+  const existing = (data?.value as any) ?? { count: 0, resetAt: now + windowSec * 1000 };
   if (now > existing.resetAt) {
-    await kv.set(k.rate(key), { count: 1, resetAt: now + windowSec * 1000 });
+    await admin.from("system_config").upsert({ key: `rate:${key}`, value: { count: 1, resetAt: now + windowSec * 1000 } });
     return true;
   }
   if (existing.count >= max) return false;
-  await kv.set(k.rate(key), { count: existing.count + 1, resetAt: existing.resetAt });
+  await admin.from("system_config").upsert({ key: `rate:${key}`, value: { count: existing.count + 1, resetAt: existing.resetAt } });
   return true;
 }
 
-// Inline guard used at the top of sensitive routes. Returns a Response when
-// over limit (so callers do `const limited = await guardRate(...); if (limited) return limited;`)
-// or null when allowed.
 async function guardRate(
-  c: any,
-  scope: string,
-  id: string,
-  max: number,
-  windowSec: number,
+  c: any, scope: string, id: string, max: number, windowSec: number,
   message = "Trop de requêtes, réessayez plus tard.",
 ): Promise<Response | null> {
   const allowed = await rateLimit(`${scope}:${id}`, max, windowSec);
@@ -267,60 +220,179 @@ function makeReferralCode(name: string) {
   return `${base}-${rand}`;
 }
 
-function notify(notifications: any[], title: string, body: string, type = "info", to?: string) {
-  notifications.unshift({
-    id: `n_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-    title,
-    body,
-    type,
-    read: false,
-    createdAt: new Date().toISOString(),
-    ...(to ? { to } : {}),
-  });
-  return notifications.slice(0, 50);
-}
-
 function formatXOFInt(n: number) {
   return `${Math.round(n).toLocaleString("fr-FR")} F CFA`;
 }
 
-// Apply payment-confirmation side effects based on the payment's `purpose`.
-// Called exactly once per successful payment (from webhook or sandbox confirm).
-async function applyPaymentSideEffects(userId: string, payment: any) {
-  const purpose = payment?.purpose ?? "cotisation";
-  const notifs = ((await kv.get(k.notifications(userId))) ?? []) as any[];
+// Helper to add a notification for a user
+async function addNotification(uid: string, title: string, body: string, type = "info") {
   try {
-    if (purpose === "renewal" && payment.contractId) {
-      const contracts = ((await kv.get(k.contracts(userId))) ?? []) as any[];
-      const idx = contracts.findIndex((ct: any) => ct.id === payment.contractId);
-      if (idx !== -1) {
-        const ct = contracts[idx];
-        const baseEnd = Math.max(Date.now(), new Date(ct.endDate).getTime());
+    await admin.from("notifications").insert({
+      user_id: uid, title, body, type, read: false,
+    });
+  } catch (err) {
+    console.log(`Notification insert error for ${uid}: ${err}`);
+  }
+}
+
+// Map DB profile row to frontend-expected camelCase
+function mapProfile(p: any) {
+  if (!p) return null;
+  return {
+    id: p.id,
+    email: p.email,
+    name: p.name,
+    phone: p.phone,
+    memberNumber: p.member_number,
+    cardActive: p.card_active,
+    cardIssuedAt: p.card_issued_at,
+    createdAt: p.created_at,
+    type: p.type,
+    firstName: p.first_name,
+    lastName: p.last_name,
+    gender: p.gender,
+    birthDate: p.birth_date,
+    birthPlace: p.birth_place,
+    profession: p.profession,
+    companyName: p.company_name,
+    ifu: p.ifu,
+    idType: p.id_type,
+    idNumber: p.id_number,
+    country: p.country,
+    countryDial: p.country_dial,
+    department: p.department,
+    city: p.city,
+    quartier: p.quartier,
+    suspended: p.suspended,
+  };
+}
+
+function mapContract(c: any) {
+  if (!c) return null;
+  return {
+    id: c.id,
+    product: c.product,
+    status: c.status,
+    startDate: c.start_date,
+    endDate: c.end_date,
+    premium: c.premium,
+    currency: c.currency,
+    frequency: c.frequency,
+    autoDebit: c.auto_debit,
+    nextBillingDate: c.next_billing_date,
+    lastPaidAt: c.last_paid_at,
+  };
+}
+
+function mapClaim(c: any, attachments: any[] = []) {
+  if (!c) return null;
+  return {
+    id: c.id,
+    contractId: c.contract_id,
+    type: c.type,
+    description: c.description,
+    amount: c.amount,
+    status: c.status,
+    createdAt: c.created_at,
+    adminNote: c.admin_note,
+    decidedAt: c.decided_at,
+    decidedBy: c.decided_by,
+    attachments: attachments.map((a: any) => ({ path: a.path, name: a.name, size: a.size })),
+  };
+}
+
+function mapPayment(p: any) {
+  if (!p) return null;
+  return {
+    id: p.id,
+    contractId: p.contract_id,
+    amount: p.amount,
+    currency: p.currency,
+    method: p.method,
+    status: p.status,
+    purpose: p.purpose,
+    createdAt: p.created_at,
+    confirmedAt: p.confirmed_at,
+    label: p.label,
+  };
+}
+
+function mapBeneficiary(b: any) {
+  if (!b) return null;
+  return {
+    id: b.id,
+    name: b.name,
+    relation: b.relation,
+    birthDate: b.birth_date,
+    createdAt: b.created_at,
+  };
+}
+
+function mapNotification(n: any) {
+  if (!n) return null;
+  return {
+    id: n.id,
+    title: n.title,
+    body: n.body,
+    type: n.type,
+    read: n.read,
+    createdAt: n.created_at,
+  };
+}
+
+function mapMessage(m: any, attachment?: any) {
+  if (!m) return null;
+  return {
+    id: m.id,
+    from: m.from_role,
+    author: m.author,
+    body: m.body,
+    createdAt: m.created_at,
+    read: m.read,
+    replyToId: m.reply_to_id,
+    editedAt: m.edited_at,
+    deletedAt: m.deleted_at,
+    ...(attachment ? { attachment: { name: attachment.name, mime: attachment.mime, size: attachment.size, path: attachment.path } } : {}),
+  };
+}
+
+function mapSettings(s: any) {
+  if (!s) return { lang: "fr", notifySms: true, notifyEmail: true };
+  return { lang: s.lang, notifySms: s.notify_sms, notifyEmail: s.notify_email };
+}
+
+// Apply payment-confirmation side effects based on the payment's `purpose`.
+async function applyPaymentSideEffects(userId: string, paymentRow: any) {
+  const purpose = paymentRow?.purpose ?? "cotisation";
+  try {
+    if (purpose === "renewal" && paymentRow.contract_id) {
+      const { data: ct } = await admin.from("contracts").select("*").eq("id", paymentRow.contract_id).maybeSingle();
+      if (ct) {
+        const baseEnd = Math.max(Date.now(), new Date(ct.end_date).getTime());
         const newEnd = new Date(baseEnd + 365 * 86400000).toISOString();
-        contracts[idx] = { ...ct, status: "active", endDate: newEnd, renewalNoticeSent: false, nextBillingDate: nextBillingFromNow() };
-        await kv.set(k.contracts(userId), contracts);
-        notify(notifs, "Contrat renouvelé", `« ${ct.product} » est prolongé jusqu'au ${new Date(newEnd).toLocaleDateString("fr-FR")}.`, "success");
+        await admin.from("contracts").update({
+          status: "active", end_date: newEnd, renewal_notice_sent: false,
+          next_billing_date: nextBillingFromNow(),
+        }).eq("id", paymentRow.contract_id);
+        await addNotification(userId, "Contrat renouvelé", `« ${ct.product} » est prolongé jusqu'au ${new Date(newEnd).toLocaleDateString("fr-FR")}.`, "success");
       }
     } else if (purpose === "card_activation") {
-      let profile = (await kv.get(k.profile(userId))) ?? {};
-      if (!profile.memberNumber) profile.memberNumber = await assignMemberNumber(userId);
-      profile = { ...profile, cardActive: true, cardIssuedAt: new Date().toISOString() };
-      await kv.set(k.profile(userId), profile);
-      notify(notifs, "Carte membre activée", `Votre carte IPPOO n° ${profile.memberNumber} est désormais active.`, "success");
-    } else if (purpose === "monthly_premium" && payment.contractId) {
-      const contracts = ((await kv.get(k.contracts(userId))) ?? []) as any[];
-      const idx = contracts.findIndex((ct: any) => ct.id === payment.contractId);
-      if (idx !== -1) {
-        contracts[idx] = { ...contracts[idx], lastPaidAt: new Date().toISOString(), nextBillingDate: nextBillingFromNow() };
-        await kv.set(k.contracts(userId), contracts);
-        notify(notifs, "Cotisation mensuelle reçue", `Paiement de ${payment.amount} FCFA confirmé pour « ${contracts[idx].product} ».`, "success");
-      }
+      const { data: profile } = await admin.from("profiles").select("*").eq("id", userId).maybeSingle();
+      let memberNumber = profile?.member_number;
+      if (!memberNumber) memberNumber = await assignMemberNumber(userId);
+      await admin.from("profiles").update({ card_active: true, card_issued_at: new Date().toISOString() }).eq("id", userId);
+      await addNotification(userId, "Carte membre activée", `Votre carte IPPOO n° ${memberNumber} est désormais active.`, "success");
+    } else if (purpose === "monthly_premium" && paymentRow.contract_id) {
+      await admin.from("contracts").update({
+        last_paid_at: new Date().toISOString(), next_billing_date: nextBillingFromNow(),
+      }).eq("id", paymentRow.contract_id);
+      const { data: ct } = await admin.from("contracts").select("product").eq("id", paymentRow.contract_id).maybeSingle();
+      await addNotification(userId, "Cotisation mensuelle reçue", `Paiement de ${paymentRow.amount} FCFA confirmé pour « ${ct?.product ?? ""} ».`, "success");
     } else {
-      notify(notifs, "Cotisation reçue", `Paiement de ${payment.amount} FCFA confirmé.`, "success");
+      await addNotification(userId, "Cotisation reçue", `Paiement de ${paymentRow.amount} FCFA confirmé.`, "success");
     }
-    await kv.set(k.notifications(userId), notifs.slice(0, 200));
   } catch (err) {
-    console.log(`[side-effect] purpose=${purpose} user=${userId} payment=${payment?.id}: ${err}`);
+    console.log(`[side-effect] purpose=${purpose} user=${userId} payment=${paymentRow?.id}: ${err}`);
   }
 }
 
@@ -334,27 +406,20 @@ function nextBillingFromNow(): string {
 async function sendInvoiceEmail(userId: string, payment: any) {
   try {
     const apiKey = Deno.env.get("RESEND_API_KEY");
-    if (!apiKey) {
-      console.log(`[email] RESEND_API_KEY not set, skipping invoice email for ${payment.id}`);
-      return;
-    }
-    const profile = (await kv.get(k.profile(userId))) as any;
+    if (!apiKey) return;
+    const { data: profile } = await admin.from("profiles").select("email, name").eq("id", userId).maybeSingle();
     const email = profile?.email;
-    if (!email) {
-      console.log(`[email] no email on profile for ${userId}, skipping`);
-      return;
-    }
-    let contract: any = null;
-    if (payment.contractId) {
-      const contracts = ((await kv.get(k.contracts(userId))) ?? []) as any[];
-      contract = contracts.find((c) => c.id === payment.contractId) ?? null;
+    if (!email) return;
+    let contractProduct = null;
+    if (payment.contract_id) {
+      const { data: ct } = await admin.from("contracts").select("product").eq("id", payment.contract_id).maybeSingle();
+      contractProduct = ct?.product ?? null;
     }
     const invoiceNumber = `INV-${String(payment.id).slice(-8).toUpperCase()}`;
-    const dateStr = new Date(payment.createdAt).toLocaleDateString("fr-FR");
-    const lineLabel = contract ? `Cotisation – ${contract.product}` : (payment.label ?? "Cotisation IPPOO");
+    const dateStr = new Date(payment.created_at).toLocaleDateString("fr-FR");
+    const lineLabel = contractProduct ? `Cotisation – ${contractProduct}` : (payment.label ?? "Cotisation IPPOO");
     const total = formatXOFInt(payment.amount ?? 0);
     const from = Deno.env.get("RESEND_FROM") ?? "IPPOO Assurance <no-reply@ippoo.app>";
-
     const html = `
       <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;background:#fff;border-radius:18px;overflow:hidden;border:1px solid #eee">
         <div style="padding:28px 32px;background:linear-gradient(115deg,#6A1B9A 0%,#B71C7E 45%,#FF3B57 82%,#FF6A2D 100%);color:#fff">
@@ -380,28 +445,15 @@ async function sendInvoiceEmail(userId: string, payment: any) {
             </tr>
           </table>
           <p style="margin:18px 0 0;color:#666;font-size:13px">Référence paiement : ${payment.id}</p>
-          <p style="margin:6px 0 0;color:#666;font-size:13px">Retrouvez votre facture dans votre espace client, onglet Documents.</p>
           <p style="margin:20px 0 0;color:#888;font-size:12px">IPPOO Assurance — La micro-assurance qui prend soin de vous au Bénin.</p>
         </div>
       </div>`;
-
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        from,
-        to: [email],
-        subject: `Facture ${invoiceNumber} — ${total}`,
-        html,
-      }),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ from, to: [email], subject: `Facture ${invoiceNumber} — ${total}`, html }),
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.log(`[email] Resend error ${res.status} for ${payment.id}: ${txt}`);
-    }
+    if (!res.ok) console.log(`[email] Resend error ${res.status} for ${payment.id}`);
   } catch (err) {
     console.log(`[email] sendInvoiceEmail failed: ${err}`);
   }
@@ -409,6 +461,9 @@ async function sendInvoiceEmail(userId: string, payment: any) {
 
 app.get(`${PREFIX}/health`, (c) => c.json({ status: "ok" }));
 
+// ============================================================
+// SIGNUP
+// ============================================================
 app.post(`${PREFIX}/signup`, async (c) => {
   try {
     const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
@@ -418,14 +473,11 @@ app.post(`${PREFIX}/signup`, async (c) => {
     if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
     const { email, password, name, phone, referralCode, profile: profileDetails } = parsed.data;
     const { data, error } = await admin.auth.admin.createUser({
-      email,
-      password,
+      email, password,
       user_metadata: { name, phone, profileType: profileDetails?.type ?? "particulier" },
-      // Email server not configured — confirm automatically
       email_confirm: true,
     });
     if (error) {
-      console.log(`Signup error for ${email}: ${error.message}`);
       const msg = /already been registered|already registered|user already exists/i.test(error.message)
         ? "Cet email est déjà associé à un compte IPPOO."
         : error.message;
@@ -433,59 +485,48 @@ app.post(`${PREFIX}/signup`, async (c) => {
     }
     const uid = data.user!.id;
     const now = new Date().toISOString();
-    const memberNumber = await assignMemberNumber(uid);
-    await kv.set(k.emailToUid(email), uid);
-    await kv.set(k.profile(uid), {
-      id: uid,
-      email,
-      name,
-      phone: phone ?? "",
-      memberNumber,
-      createdAt: now,
-      type: profileDetails?.type ?? "particulier",
-      firstName: profileDetails?.firstName ?? null,
-      lastName: profileDetails?.lastName ?? null,
-      gender: profileDetails?.gender ?? null,
-      birthDate: profileDetails?.birthDate ?? null,
-      birthPlace: profileDetails?.birthPlace ?? null,
-      profession: profileDetails?.profession ?? null,
-      companyName: profileDetails?.companyName ?? null,
-      ifu: profileDetails?.ifu ?? null,
-      idType: profileDetails?.idType ?? null,
-      idNumber: profileDetails?.idNumber ?? null,
-      country: profileDetails?.country ?? "BJ",
-      countryDial: profileDetails?.countryDial ?? "229",
-      department: profileDetails?.department ?? null,
-      city: profileDetails?.city ?? null,
-      quartier: profileDetails?.quartier ?? null,
-    });
-    await kv.set(k.contracts(uid), []);
-    await kv.set(k.claims(uid), []);
-    await kv.set(k.payments(uid), []);
-    await kv.set(k.beneficiaries(uid), []);
-    await kv.set(k.documents(uid), []);
-    await kv.set(k.notifications(uid), notify([], "Bienvenue chez IPPOO", "Votre espace est prêt. Souscrivez à une couverture pour démarrer.", "success"));
-    await kv.set(k.messages(uid), []);
-    await kv.set(k.settings(uid), { lang: "fr", notifySms: true, notifyEmail: true });
-    // Referral: assign a unique code to the new user
-    const code = makeReferralCode(name);
-    await kv.set(k.referralCode(uid), code);
-    await kv.set(k.referralByCode(code), uid);
-    // Redeem incoming referral if provided
+    const memberNumber = randomMemberNumber();
+    const referralCodeForUser = makeReferralCode(name);
+
+    // Find referrer if code provided
+    let referredByUid: string | null = null;
     if (referralCode && typeof referralCode === "string") {
-      const refererUid = await kv.get(k.referralByCode(referralCode.toUpperCase().trim()));
-      if (refererUid && refererUid !== uid) {
-        const reds = (await kv.get(k.referralRedemptions(refererUid))) ?? [];
-        reds.push({ uid, at: now });
-        await kv.set(k.referralRedemptions(refererUid), reds);
-        const refNotifs = (await kv.get(k.notifications(refererUid))) ?? [];
-        await kv.set(
-          k.notifications(refererUid),
-          notify(refNotifs, "Parrainage validé", `Un nouveau filleul rejoint IPPOO grâce à votre code ${referralCode}.`, "success"),
-        );
-      }
+      const { data: ref } = await admin.from("profiles").select("id").eq("referral_code", referralCode.toUpperCase().trim()).maybeSingle();
+      if (ref?.id && ref.id !== uid) referredByUid = ref.id;
     }
-    await audit(uid, "signup", { email, ip });
+
+    // Ensure member number is unique
+    let finalMemberNumber = memberNumber;
+    for (let i = 0; i < 12; i++) {
+      const { data: existing } = await admin.from("profiles").select("id").eq("member_number", finalMemberNumber).maybeSingle();
+      if (!existing) break;
+      finalMemberNumber = randomMemberNumber();
+    }
+
+    await admin.from("profiles").insert({
+      id: uid, email, name, phone: phone ?? "", member_number: finalMemberNumber,
+      created_at: now, type: profileDetails?.type ?? "particulier",
+      first_name: profileDetails?.firstName ?? null, last_name: profileDetails?.lastName ?? null,
+      gender: profileDetails?.gender ?? null, birth_date: profileDetails?.birthDate ?? null,
+      birth_place: profileDetails?.birthPlace ?? null, profession: profileDetails?.profession ?? null,
+      company_name: profileDetails?.companyName ?? null, ifu: profileDetails?.ifu ?? null,
+      id_type: profileDetails?.idType ?? null, id_number: profileDetails?.idNumber ?? null,
+      country: profileDetails?.country ?? "BJ", country_dial: profileDetails?.countryDial ?? "229",
+      department: profileDetails?.department ?? null, city: profileDetails?.city ?? null,
+      quartier: profileDetails?.quartier ?? null, referral_code: referralCodeForUser,
+      referred_by: referredByUid,
+    });
+
+    await admin.from("settings").insert({ user_id: uid, lang: "fr", notify_sms: true, notify_email: true });
+
+    await addNotification(uid, "Bienvenue chez IPPOO", "Votre espace est prêt. Souscrivez à une couverture pour démarrer.", "success");
+
+    // Notify referrer
+    if (referredByUid) {
+      await addNotification(referredByUid, "Parrainage validé", `Un nouveau filleul rejoint IPPOO grâce à votre code ${referralCode}.`, "success");
+    }
+
+    await auditLog(uid, "signup", { email, ip });
     return c.json({ ok: true });
   } catch (err) {
     console.log(`Signup exception: ${err}`);
@@ -493,20 +534,18 @@ app.post(`${PREFIX}/signup`, async (c) => {
   }
 });
 
+// ============================================================
+// ME (Profile)
+// ============================================================
 app.get(`${PREFIX}/me`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  let profile = await kv.get(k.profile(user.id));
-  // Backfill memberNumber + email→uid mapping for legacy users
-  if (profile && !profile.memberNumber) {
-    profile = { ...profile, memberNumber: await assignMemberNumber(user.id) };
-    await kv.set(k.profile(user.id), profile);
+  const { data: profile } = await admin.from("profiles").select("*").eq("id", user.id).maybeSingle();
+  if (profile && !profile.member_number) {
+    const memberNumber = await assignMemberNumber(user.id);
+    return c.json({ profile: mapProfile({ ...profile, member_number: memberNumber }) });
   }
-  if (profile?.email) {
-    const mapped = await kv.get(k.emailToUid(profile.email));
-    if (!mapped) await kv.set(k.emailToUid(profile.email), user.id);
-  }
-  return c.json({ profile });
+  return c.json({ profile: mapProfile(profile) });
 });
 
 app.put(`${PREFIX}/me`, async (c) => {
@@ -515,28 +554,70 @@ app.put(`${PREFIX}/me`, async (c) => {
   try {
     const parsed = await parseBody(c, ProfileUpdateSchema);
     if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-    const current = (await kv.get(k.profile(user.id))) ?? {};
-    const next = { ...current, ...parsed.data, id: user.id };
-    await kv.set(k.profile(user.id), next);
-    return c.json({ profile: next });
+    const d = parsed.data as any;
+    const updates: Record<string, any> = {};
+    if (d.name !== undefined) updates.name = d.name;
+    if (d.phone !== undefined) updates.phone = d.phone;
+    if (d.firstName !== undefined) updates.first_name = d.firstName;
+    if (d.lastName !== undefined) updates.last_name = d.lastName;
+    if (d.gender !== undefined) updates.gender = d.gender;
+    if (d.birthDate !== undefined) updates.birth_date = d.birthDate;
+    if (d.birthPlace !== undefined) updates.birth_place = d.birthPlace;
+    if (d.profession !== undefined) updates.profession = d.profession;
+    if (d.companyName !== undefined) updates.company_name = d.companyName;
+    if (d.ifu !== undefined) updates.ifu = d.ifu;
+    if (d.idType !== undefined) updates.id_type = d.idType;
+    if (d.idNumber !== undefined) updates.id_number = d.idNumber;
+    if (d.country !== undefined) updates.country = d.country;
+    if (d.countryDial !== undefined) updates.country_dial = d.countryDial;
+    if (d.department !== undefined) updates.department = d.department;
+    if (d.city !== undefined) updates.city = d.city;
+    if (d.quartier !== undefined) updates.quartier = d.quartier;
+    const { data: updated } = await admin.from("profiles").update(updates).eq("id", user.id).select("*").maybeSingle();
+    return c.json({ profile: mapProfile(updated) });
   } catch (err) {
-    console.log(`Profile update error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur de mise à jour du profil: ${err}` }, 500);
   }
 });
 
+// ============================================================
+// CONTRACTS
+// ============================================================
 app.get(`${PREFIX}/contracts`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-  return c.json({ contracts });
+  const { data: contracts } = await admin.from("contracts").select("*").eq("user_id", user.id).order("created_at", { ascending: false });
+  return c.json({ contracts: (contracts ?? []).map(mapContract) });
 });
 
+app.patch(`${PREFIX}/contracts/:id/auto-debit`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const id = c.req.param("id");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const enabled = !!body?.enabled;
+    const { data: ct } = await admin.from("contracts").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
+    if (!ct) return c.json({ error: "Contrat introuvable" }, 404);
+    const { data: updated } = await admin.from("contracts").update({
+      auto_debit: enabled,
+      next_billing_date: enabled ? (ct.next_billing_date ?? nextBillingFromNow()) : null,
+    }).eq("id", id).select("*").maybeSingle();
+    await auditLog(user.id, "contract.autoDebit", { id, enabled });
+    return c.json({ contract: mapContract(updated) });
+  } catch (err) {
+    return c.json({ error: `${err}` }, 500);
+  }
+});
+
+// ============================================================
+// CLAIMS
+// ============================================================
 app.get(`${PREFIX}/claims`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const claims = (await kv.get(k.claims(user.id))) ?? [];
-  return c.json({ claims });
+  const { data: claims } = await admin.from("claims").select("*, claim_attachments(*)").eq("user_id", user.id).order("created_at", { ascending: false });
+  return c.json({ claims: (claims ?? []).map((cl: any) => mapClaim(cl, cl.claim_attachments ?? [])) });
 });
 
 app.post(`${PREFIX}/claims`, async (c) => {
@@ -548,214 +629,18 @@ app.post(`${PREFIX}/claims`, async (c) => {
     const parsed = await parseBody(c, ClaimCreateSchema);
     if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
     const { contractId, type, description, amount } = parsed.data;
-    const claim = {
-      id: `s_${Date.now()}`,
-      contractId: contractId ?? null,
-      type,
-      description,
-      amount: typeof amount === "number" ? amount : 0,
-      status: "en_cours",
-      createdAt: new Date().toISOString(),
-      attachments: [] as { path: string; name: string; size: number }[],
-    };
-    const claims = (await kv.get(k.claims(user.id))) ?? [];
-    claims.unshift(claim);
-    await kv.set(k.claims(user.id), claims);
-    const notifs = (await kv.get(k.notifications(user.id))) ?? [];
-    await kv.set(k.notifications(user.id), notify(notifs, "Sinistre déclaré", `Votre déclaration « ${type} » est en cours d'instruction.`, "info"));
-    return c.json({ claim });
+    const { data: claim } = await admin.from("claims").insert({
+      user_id: user.id, contract_id: contractId ?? null, type, description,
+      amount: typeof amount === "number" ? amount : 0, status: "en_cours",
+    }).select("*").maybeSingle();
+    await addNotification(user.id, "Sinistre déclaré", `Votre déclaration « ${type} » est en cours d'instruction.`, "info");
+    return c.json({ claim: mapClaim(claim) });
   } catch (err) {
-    console.log(`Claim create error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur de création du sinistre: ${err}` }, 500);
   }
 });
 
-app.get(`${PREFIX}/payments`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const payments = (await kv.get(k.payments(user.id))) ?? [];
-  return c.json({ payments });
-});
-
-// Initiate a Mobile Money payment via KkiaPay (Bénin). Returns a pending payment
-// + the public key so the client can launch the widget. If no KKIAPAY_PUBLIC_KEY
-// is configured, we fall back to a mock flow that can be confirmed by the client
-// via /payments/confirm-mock (DEV/sandbox only).
-app.post(`${PREFIX}/payments/initiate`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  try {
-    const parsed = await parseBody(c, PaymentInitiateSchema);
-    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-    const { contractId, amount, phone, purpose, paymentId } = parsed.data;
-    const allowed = await rateLimit(`pay-init:${user.id}`, 10, 600);
-    if (!allowed) return c.json({ error: "Trop de tentatives, réessayez plus tard." }, 429);
-    const publicKey = Deno.env.get("KKIAPAY_PUBLIC_KEY") ?? "";
-    const mode: "kkiapay" | "mock" = publicKey ? "kkiapay" : "mock";
-    const now = new Date().toISOString();
-    const payments = (await kv.get(k.payments(user.id))) ?? [];
-    let payment: any;
-    if (paymentId) {
-      const idx = payments.findIndex((p: any) => p.id === paymentId);
-      if (idx === -1) return c.json({ error: "Paiement introuvable" }, 404);
-      if (payments[idx].status === "confirme") return c.json({ error: "Déjà confirmé" }, 400);
-      payments[idx] = { ...payments[idx], phone: phone ?? payments[idx].phone ?? null, mode, status: "en_attente" };
-      payment = payments[idx];
-    } else {
-      payment = {
-        id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        contractId: contractId ?? null,
-        amount,
-        currency: "XOF",
-        method: "mobile_money",
-        status: "en_attente" as const,
-        phone: phone ?? null,
-        mode,
-        purpose: purpose ?? "cotisation",
-        createdAt: now,
-      };
-      payments.unshift(payment);
-    }
-    await kv.set(k.payments(user.id), payments);
-    await audit(user.id, "payment.initiated", { id: payment.id, amount, mode, purpose: payment.purpose });
-    return c.json({
-      payment,
-      kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") },
-    });
-  } catch (err) {
-    console.log(`Payment initiate error for ${user.id}: ${err}`);
-    return c.json({ error: `Erreur initialisation paiement: ${err}` }, 500);
-  }
-});
-
-// KkiaPay webhook. Production: verify the X-Kkiapay-Secret header against the
-// shared secret stored in env, then mark the matching payment confirmed.
-app.post(`${PREFIX}/payments/webhook`, async (c) => {
-  try {
-    const secret = Deno.env.get("KKIAPAY_SECRET");
-    const provided = c.req.header("X-Kkiapay-Secret") ?? c.req.header("x-kkiapay-secret") ?? "";
-    if (!secret || provided !== secret) {
-      return c.json({ error: "Signature invalide" }, 401);
-    }
-    const body = await c.req.json();
-    // KkiaPay payload shape: { transactionId, state, amount, data: { paymentId, userId } }
-    const { state, data, amount } = body ?? {};
-    const paymentId = data?.paymentId;
-    const userId = data?.userId;
-    if (!paymentId || !userId) return c.json({ error: "Données manquantes" }, 400);
-    const payments = ((await kv.get(k.payments(userId))) ?? []) as any[];
-    const idx = payments.findIndex((p) => p.id === paymentId);
-    if (idx === -1) return c.json({ error: "Paiement introuvable" }, 404);
-    const next = state === "SUCCESS" ? "confirme" : "echec";
-    payments[idx] = { ...payments[idx], status: next, confirmedAt: new Date().toISOString() };
-    await kv.set(k.payments(userId), payments);
-    if (next === "confirme") {
-      await applyPaymentSideEffects(userId, payments[idx]);
-      sendInvoiceEmail(userId, payments[idx]);
-    }
-    await audit(userId, `payment.${next}`, { id: paymentId, amount, purpose: payments[idx].purpose });
-    return c.json({ ok: true });
-  } catch (err) {
-    console.log(`Payment webhook error: ${err}`);
-    return c.json({ error: "Erreur webhook" }, 500);
-  }
-});
-
-// Sandbox/mock confirmation. Only allowed when no KKIAPAY_SECRET is set,
-// because in production KkiaPay must call /payments/webhook directly.
-app.post(`${PREFIX}/payments/:id/confirm-mock`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  if (Deno.env.get("KKIAPAY_SECRET") || Deno.env.get("APP_ENV") === "production" || Deno.env.get("KKIAPAY_PUBLIC_KEY")) {
-    return c.json({ error: "Mode mock désactivé : passez par KkiaPay." }, 403);
-  }
-  const id = c.req.param("id");
-  const payments = ((await kv.get(k.payments(user.id))) ?? []) as any[];
-  const idx = payments.findIndex((p) => p.id === id);
-  if (idx === -1) return c.json({ error: "Paiement introuvable" }, 404);
-  if (payments[idx].status === "confirme") return c.json({ payment: payments[idx] });
-  payments[idx] = { ...payments[idx], status: "confirme", confirmedAt: new Date().toISOString() };
-  await kv.set(k.payments(user.id), payments);
-  await applyPaymentSideEffects(user.id, payments[idx]);
-  await audit(user.id, "payment.confirme", { id, mode: "mock", purpose: payments[idx].purpose });
-  sendInvoiceEmail(user.id, payments[idx]);
-  return c.json({ payment: payments[idx] });
-});
-
-app.get(`${PREFIX}/payments/:id`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const id = c.req.param("id");
-  const payments = ((await kv.get(k.payments(user.id))) ?? []) as any[];
-  const payment = payments.find((p) => p.id === id);
-  if (!payment) return c.json({ error: "Paiement introuvable" }, 404);
-  return c.json({ payment });
-});
-
-app.post(`${PREFIX}/payments`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const limited = await guardRate(c, "pay-legacy", user.id, 10, 600);
-  if (limited) return limited;
-  try {
-    const parsed = await parseBody(c, PaymentLegacySchema);
-    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-    const { contractId, amount, method } = parsed.data;
-    const payment = {
-      id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      contractId: contractId ?? null,
-      amount,
-      currency: "XOF",
-      method: method ?? "mobile_money",
-      status: "en_attente" as const,
-      purpose: "cotisation" as const,
-      createdAt: new Date().toISOString(),
-    };
-    const payments = (await kv.get(k.payments(user.id))) ?? [];
-    payments.unshift(payment);
-    await kv.set(k.payments(user.id), payments);
-    return c.json({ payment });
-  } catch (err) {
-    console.log(`Payment create error for ${user.id}: ${err}`);
-    return c.json({ error: `Erreur de cotisation: ${err}` }, 500);
-  }
-});
-
-// ---- BENEFICIARIES ----
-app.get(`${PREFIX}/beneficiaries`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const beneficiaries = (await kv.get(k.beneficiaries(user.id))) ?? [];
-  return c.json({ beneficiaries });
-});
-
-app.post(`${PREFIX}/beneficiaries`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const limited = await guardRate(c, "ben", user.id, 20, 3600);
-  if (limited) return limited;
-  try {
-    const parsed = await parseBody(c, BeneficiaryCreateSchema);
-    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-    const { name, relation, birthDate } = parsed.data;
-    const beneficiary = {
-      id: `b_${Date.now()}`,
-      name,
-      relation,
-      birthDate: birthDate ?? null,
-      createdAt: new Date().toISOString(),
-    };
-    const list = (await kv.get(k.beneficiaries(user.id))) ?? [];
-    list.push(beneficiary);
-    await kv.set(k.beneficiaries(user.id), list);
-    return c.json({ beneficiary });
-  } catch (err) {
-    console.log(`Beneficiary create error for ${user.id}: ${err}`);
-    return c.json({ error: `Erreur d'ajout du bénéficiaire: ${err}` }, 500);
-  }
-});
-
-// Upload an attachment for an existing claim (multipart form-data)
+// Upload attachment for a claim
 app.post(`${PREFIX}/claims/:id/attachments`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -770,19 +655,16 @@ app.post(`${PREFIX}/claims/:id/attachments`, async (c) => {
     const path = `${user.id}/${id}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9_.-]/g, "_")}`;
     const { error: uploadErr } = await admin.storage.from(BUCKET).upload(path, file, { contentType: file.type, upsert: false });
     if (uploadErr) return c.json({ error: `Erreur d'upload: ${uploadErr.message}` }, 500);
-    const claims = (await kv.get(k.claims(user.id))) ?? [];
-    const idx = claims.findIndex((cl: any) => cl.id === id);
-    if (idx === -1) return c.json({ error: "Sinistre introuvable" }, 404);
-    claims[idx].attachments = [...(claims[idx].attachments ?? []), { path, name: file.name, size: file.size }];
-    await kv.set(k.claims(user.id), claims);
+    // Verify claim belongs to user
+    const { data: cl } = await admin.from("claims").select("id").eq("id", id).eq("user_id", user.id).maybeSingle();
+    if (!cl) return c.json({ error: "Sinistre introuvable" }, 404);
+    await admin.from("claim_attachments").insert({ claim_id: id, user_id: user.id, path, name: file.name, size: file.size });
     return c.json({ ok: true, attachment: { path, name: file.name, size: file.size } });
   } catch (err) {
-    console.log(`Attachment upload error: ${err}`);
     return c.json({ error: `Erreur d'upload: ${err}` }, 500);
   }
 });
 
-// Signed URL for an attachment (5 min)
 app.get(`${PREFIX}/claims/attachments/url`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -793,137 +675,282 @@ app.get(`${PREFIX}/claims/attachments/url`, async (c) => {
   return c.json({ url: data.signedUrl });
 });
 
+// ============================================================
+// PAYMENTS
+// ============================================================
+app.get(`${PREFIX}/payments`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const { data: payments } = await admin.from("payments").select("*").eq("user_id", user.id).order("created_at", { ascending: false });
+  return c.json({ payments: (payments ?? []).map(mapPayment) });
+});
+
+app.get(`${PREFIX}/payments/:id`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const id = c.req.param("id");
+  const { data: payment } = await admin.from("payments").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
+  if (!payment) return c.json({ error: "Paiement introuvable" }, 404);
+  return c.json({ payment: mapPayment(payment) });
+});
+
+app.post(`${PREFIX}/payments`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const limited = await guardRate(c, "pay-legacy", user.id, 10, 600);
+  if (limited) return limited;
+  try {
+    const parsed = await parseBody(c, PaymentLegacySchema);
+    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
+    const { contractId, amount, method } = parsed.data;
+    const { data: payment } = await admin.from("payments").insert({
+      user_id: user.id, contract_id: contractId ?? null, amount,
+      currency: "XOF", method: method ?? "mobile_money", status: "en_attente", purpose: "cotisation",
+    }).select("*").maybeSingle();
+    return c.json({ payment: mapPayment(payment) });
+  } catch (err) {
+    return c.json({ error: `Erreur de cotisation: ${err}` }, 500);
+  }
+});
+
+app.post(`${PREFIX}/payments/initiate`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  try {
+    const parsed = await parseBody(c, PaymentInitiateSchema);
+    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
+    const { contractId, amount, phone, purpose, paymentId } = parsed.data;
+    const allowed = await rateLimit(`pay-init:${user.id}`, 10, 600);
+    if (!allowed) return c.json({ error: "Trop de tentatives, réessayez plus tard." }, 429);
+    const publicKey = Deno.env.get("KKIAPAY_PUBLIC_KEY") ?? "";
+    const mode: "kkiapay" | "mock" = publicKey ? "kkiapay" : "mock";
+    let payment: any;
+    if (paymentId) {
+      const { data: existing } = await admin.from("payments").select("*").eq("id", paymentId).eq("user_id", user.id).maybeSingle();
+      if (!existing) return c.json({ error: "Paiement introuvable" }, 404);
+      if (existing.status === "confirme") return c.json({ error: "Déjà confirmé" }, 400);
+      const { data: updated } = await admin.from("payments").update({ status: "en_attente" }).eq("id", paymentId).select("*").maybeSingle();
+      payment = updated;
+    } else {
+      const { data: created } = await admin.from("payments").insert({
+        user_id: user.id, contract_id: contractId ?? null, amount, currency: "XOF",
+        method: "mobile_money", status: "en_attente", purpose: purpose ?? "cotisation",
+      }).select("*").maybeSingle();
+      payment = created;
+    }
+    await auditLog(user.id, "payment.initiated", { id: payment.id, amount, mode, purpose: payment.purpose });
+    const mapped = mapPayment(payment);
+    return c.json({ payment: { ...mapped, mode }, kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") } });
+  } catch (err) {
+    return c.json({ error: `Erreur initialisation paiement: ${err}` }, 500);
+  }
+});
+
+app.post(`${PREFIX}/payments/webhook`, async (c) => {
+  try {
+    const secret = Deno.env.get("KKIAPAY_SECRET");
+    const provided = c.req.header("X-Kkiapay-Secret") ?? c.req.header("x-kkiapay-secret") ?? "";
+    if (!secret || provided !== secret) return c.json({ error: "Signature invalide" }, 401);
+    const body = await c.req.json();
+    const { state, data, amount } = body ?? {};
+    const paymentId = data?.paymentId;
+    const userId = data?.userId;
+    if (!paymentId || !userId) return c.json({ error: "Données manquantes" }, 400);
+    const { data: payment } = await admin.from("payments").select("*").eq("id", paymentId).maybeSingle();
+    if (!payment) return c.json({ error: "Paiement introuvable" }, 404);
+    const next = state === "SUCCESS" ? "confirme" : "echec";
+    const { data: updated } = await admin.from("payments").update({ status: next, confirmed_at: new Date().toISOString() }).eq("id", paymentId).select("*").maybeSingle();
+    if (next === "confirme") {
+      await applyPaymentSideEffects(userId, updated);
+      sendInvoiceEmail(userId, updated);
+    }
+    await auditLog(userId, `payment.${next}`, { id: paymentId, amount, purpose: payment.purpose });
+    return c.json({ ok: true });
+  } catch (err) {
+    return c.json({ error: "Erreur webhook" }, 500);
+  }
+});
+
+app.post(`${PREFIX}/payments/:id/confirm-mock`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  if (Deno.env.get("KKIAPAY_SECRET") || Deno.env.get("APP_ENV") === "production" || Deno.env.get("KKIAPAY_PUBLIC_KEY")) {
+    return c.json({ error: "Mode mock désactivé : passez par KkiaPay." }, 403);
+  }
+  const id = c.req.param("id");
+  const { data: payment } = await admin.from("payments").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
+  if (!payment) return c.json({ error: "Paiement introuvable" }, 404);
+  if (payment.status === "confirme") return c.json({ payment: mapPayment(payment) });
+  const { data: updated } = await admin.from("payments").update({ status: "confirme", confirmed_at: new Date().toISOString() }).eq("id", id).select("*").maybeSingle();
+  await applyPaymentSideEffects(user.id, updated);
+  await auditLog(user.id, "payment.confirme", { id, mode: "mock", purpose: payment.purpose });
+  sendInvoiceEmail(user.id, updated);
+  return c.json({ payment: mapPayment(updated) });
+});
+
+// ============================================================
+// BENEFICIARIES
+// ============================================================
+app.get(`${PREFIX}/beneficiaries`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const { data: beneficiaries } = await admin.from("beneficiaries").select("*").eq("user_id", user.id).order("created_at", { ascending: false });
+  return c.json({ beneficiaries: (beneficiaries ?? []).map(mapBeneficiary) });
+});
+
+app.post(`${PREFIX}/beneficiaries`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const limited = await guardRate(c, "ben", user.id, 20, 3600);
+  if (limited) return limited;
+  try {
+    const parsed = await parseBody(c, BeneficiaryCreateSchema);
+    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
+    const { name, relation, birthDate } = parsed.data;
+    const { data: beneficiary } = await admin.from("beneficiaries").insert({
+      user_id: user.id, name, relation, birth_date: birthDate ?? null,
+    }).select("*").maybeSingle();
+    return c.json({ beneficiary: mapBeneficiary(beneficiary) });
+  } catch (err) {
+    return c.json({ error: `Erreur d'ajout du bénéficiaire: ${err}` }, 500);
+  }
+});
+
 app.delete(`${PREFIX}/beneficiaries/:id`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   const id = c.req.param("id");
-  const list = ((await kv.get(k.beneficiaries(user.id))) ?? []).filter((b: any) => b.id !== id);
-  await kv.set(k.beneficiaries(user.id), list);
+  await admin.from("beneficiaries").delete().eq("id", id).eq("user_id", user.id);
   return c.json({ ok: true });
 });
 
-// ---- DOCUMENTS ----
+// ============================================================
+// DOCUMENTS
+// ============================================================
 app.get(`${PREFIX}/documents`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const documents = (await kv.get(k.documents(user.id))) ?? [];
-  return c.json({ documents });
+  const { data: documents } = await admin.from("documents").select("*").eq("user_id", user.id).order("created_at", { ascending: false });
+  return c.json({
+    documents: (documents ?? []).map((d: any) => ({
+      id: d.id, name: d.name, type: d.type, category: d.category, size: d.size, createdAt: d.created_at,
+    })),
+  });
 });
 
-// ---- NOTIFICATIONS ----
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
 app.get(`${PREFIX}/notifications`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const notifications = (await kv.get(k.notifications(user.id))) ?? [];
-  return c.json({ notifications });
+  const { data: notifications } = await admin.from("notifications").select("*").eq("user_id", user.id).order("created_at", { ascending: false }).limit(50);
+  return c.json({ notifications: (notifications ?? []).map(mapNotification) });
 });
 
 app.post(`${PREFIX}/notifications/read`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const list = ((await kv.get(k.notifications(user.id))) ?? []).map((n: any) => ({ ...n, read: true }));
-  await kv.set(k.notifications(user.id), list);
+  await admin.from("notifications").update({ read: true }).eq("user_id", user.id).eq("read", false);
   return c.json({ ok: true });
 });
 
-// ---- MESSAGES ----
+// ============================================================
+// MESSAGES
+// ============================================================
+const EDIT_WINDOW_MS = 5 * 60 * 1000;
+
+async function getMessageWithAttachment(msgRow: any) {
+  if (!msgRow) return null;
+  const { data: att } = await admin.from("message_attachments").select("*").eq("message_id", msgRow.id).maybeSingle();
+  return mapMessage(msgRow, att);
+}
+
 app.get(`${PREFIX}/messages`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const messages = (await kv.get(k.messages(user.id))) ?? [];
-  return c.json({ messages });
+  const { data: messages } = await admin.from("messages").select("*, message_attachments(*)").eq("user_id", user.id).order("created_at", { ascending: true });
+  return c.json({
+    messages: (messages ?? []).map((m: any) =>
+      mapMessage(m, m.message_attachments?.[0])
+    ),
+  });
 });
 
-const EDIT_WINDOW_MS = 5 * 60 * 1000;
+app.post(`${PREFIX}/messages`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const limited = await guardRate(c, "msg", user.id, 30, 600);
+  if (limited) return limited;
+  try {
+    const parsed = await parseBody(c, MessageCreateSchema);
+    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
+    const content = parsed.data.content.trim();
+    if (!content) return c.json({ error: "Message vide" }, 400);
+    const replyToId = typeof (parsed.data as any).replyToId === "string" ? (parsed.data as any).replyToId : null;
+    const { data: profile } = await admin.from("profiles").select("name").eq("id", user.id).maybeSingle();
+    const { data: msg } = await admin.from("messages").insert({
+      user_id: user.id, from_role: "user", author: profile?.name ?? "Vous",
+      body: content, read: true, reply_to_id: replyToId,
+    }).select("*").maybeSingle();
+    const mapped = mapMessage(msg);
+    await Promise.all([
+      broadcast(`chat:${user.id}`, "message:new", { message: mapped }),
+      broadcast(`admin:chat`, "message:new", { userId: user.id, message: mapped }),
+    ]);
+    return c.json({ messages: [mapped] });
+  } catch (err) {
+    return c.json({ error: `Erreur lors de l'envoi: ${err}` }, 500);
+  }
+});
 
-// Edit own message (5 min window).
 app.patch(`${PREFIX}/messages/:id`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   const id = c.req.param("id");
   const parsed = await parseBody(c, MessageEditSchema);
   if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-  const list = ((await kv.get(k.messages(user.id))) ?? []) as any[];
-  const idx = list.findIndex((m) => m.id === id);
-  if (idx < 0) return c.json({ error: "Message introuvable" }, 404);
-  const m = list[idx];
-  if (m.from !== "user") return c.json({ error: "Édition refusée" }, 403);
-  if (m.deletedAt) return c.json({ error: "Message supprimé" }, 410);
-  if (Date.now() - new Date(m.createdAt).getTime() > EDIT_WINDOW_MS) return c.json({ error: "Fenêtre d'édition expirée" }, 409);
-  const updated = { ...m, body: parsed.data.content.trim(), editedAt: new Date().toISOString() };
-  list[idx] = updated;
-  await kv.set(k.messages(user.id), list);
+  const { data: m } = await admin.from("messages").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
+  if (!m) return c.json({ error: "Message introuvable" }, 404);
+  if (m.from_role !== "user") return c.json({ error: "Édition refusée" }, 403);
+  if (m.deleted_at) return c.json({ error: "Message supprimé" }, 410);
+  if (Date.now() - new Date(m.created_at).getTime() > EDIT_WINDOW_MS) return c.json({ error: "Fenêtre d'édition expirée" }, 409);
+  const { data: updated } = await admin.from("messages").update({ body: parsed.data.content.trim(), edited_at: new Date().toISOString() }).eq("id", id).select("*").maybeSingle();
+  const mapped = mapMessage(updated);
   await Promise.all([
-    broadcast(`chat:${user.id}`, "message:update", { message: updated }),
-    broadcast(`admin:chat`, "message:update", { userId: user.id, message: updated }),
+    broadcast(`chat:${user.id}`, "message:update", { message: mapped }),
+    broadcast(`admin:chat`, "message:update", { userId: user.id, message: mapped }),
   ]);
-  return c.json({ message: updated });
+  return c.json({ message: mapped });
 });
 
-// Soft-delete own message. Body cleared, attachment hidden.
 app.delete(`${PREFIX}/messages/:id`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   const id = c.req.param("id");
-  const list = ((await kv.get(k.messages(user.id))) ?? []) as any[];
-  const idx = list.findIndex((m) => m.id === id);
-  if (idx < 0) return c.json({ error: "Message introuvable" }, 404);
-  if (list[idx].from !== "user") return c.json({ error: "Suppression refusée" }, 403);
-  const updated = { ...list[idx], body: "", deletedAt: new Date().toISOString(), attachment: undefined };
-  list[idx] = updated;
-  await kv.set(k.messages(user.id), list);
+  const { data: m } = await admin.from("messages").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
+  if (!m) return c.json({ error: "Message introuvable" }, 404);
+  if (m.from_role !== "user") return c.json({ error: "Suppression refusée" }, 403);
+  const { data: updated } = await admin.from("messages").update({ body: "", deleted_at: new Date().toISOString() }).eq("id", id).select("*").maybeSingle();
+  const mapped = mapMessage(updated);
   await Promise.all([
-    broadcast(`chat:${user.id}`, "message:update", { message: updated }),
-    broadcast(`admin:chat`, "message:update", { userId: user.id, message: updated }),
+    broadcast(`chat:${user.id}`, "message:update", { message: mapped }),
+    broadcast(`admin:chat`, "message:update", { userId: user.id, message: mapped }),
   ]);
-  return c.json({ message: updated });
+  return c.json({ message: mapped });
 });
 
-// Admin edit/delete on advisor messages.
-app.patch(`${PREFIX}/admin/messages/:uid/:id`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  const id = c.req.param("id");
-  const parsed = await parseBody(c, MessageEditSchema);
-  if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-  const list = ((await kv.get(k.messages(uid))) ?? []) as any[];
-  const idx = list.findIndex((m) => m.id === id);
-  if (idx < 0) return c.json({ error: "Message introuvable" }, 404);
-  if (list[idx].from !== "conseiller") return c.json({ error: "Édition refusée" }, 403);
-  if (list[idx].deletedAt) return c.json({ error: "Message supprimé" }, 410);
-  const updated = { ...list[idx], body: parsed.data.content.trim(), editedAt: new Date().toISOString() };
-  list[idx] = updated;
-  await kv.set(k.messages(uid), list);
-  await audit(uid, "message.admin_edit", { by: r.admin.username, id });
-  await Promise.all([
-    broadcast(`chat:${uid}`, "message:update", { message: updated }),
-    broadcast(`admin:chat`, "message:update", { userId: uid, message: updated }),
-  ]);
-  return c.json({ message: updated });
+app.post(`${PREFIX}/messages/read`, async (c) => {
+  const { user, error } = await requireUser(c);
+  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
+  const { count } = await admin.from("messages").update({ read: true }).eq("user_id", user.id).eq("from_role", "conseiller").eq("read", false).select("*", { count: "exact", head: true });
+  const changed = count ?? 0;
+  if (changed > 0) {
+    await broadcast(`admin:chat`, "message:read", { userId: user.id, count: changed, at: new Date().toISOString() });
+  }
+  return c.json({ ok: true, marked: changed });
 });
 
-app.delete(`${PREFIX}/admin/messages/:uid/:id`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  const id = c.req.param("id");
-  const list = ((await kv.get(k.messages(uid))) ?? []) as any[];
-  const idx = list.findIndex((m) => m.id === id);
-  if (idx < 0) return c.json({ error: "Message introuvable" }, 404);
-  if (list[idx].from !== "conseiller") return c.json({ error: "Suppression refusée" }, 403);
-  const updated = { ...list[idx], body: "", deletedAt: new Date().toISOString(), attachment: undefined };
-  list[idx] = updated;
-  await kv.set(k.messages(uid), list);
-  await audit(uid, "message.admin_delete", { by: r.admin.username, id });
-  await Promise.all([
-    broadcast(`chat:${uid}`, "message:update", { message: updated }),
-    broadcast(`admin:chat`, "message:update", { userId: uid, message: updated }),
-  ]);
-  return c.json({ message: updated });
-});
-
-// Upload an attachment as a chat message. multipart/form-data: file=<File>, [caption]=string
 app.post(`${PREFIX}/messages/attachment`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -940,70 +967,22 @@ app.post(`${PREFIX}/messages/attachment`, async (c) => {
     const path = `${user.id}/${Date.now()}_${safeName}`;
     const { error: upErr } = await admin.storage.from(MSG_BUCKET).upload(path, file, { contentType: file.type, upsert: false });
     if (upErr) return c.json({ error: `Upload échoué: ${upErr.message}` }, 500);
-    const profile = (await kv.get(k.profile(user.id))) ?? {};
-    const userMsg = {
-      id: `m_${Date.now()}`,
-      from: "user",
-      author: profile.name ?? "Vous",
-      body: caption,
-      createdAt: new Date().toISOString(),
-      read: true,
-      attachment: { name: file.name, mime: file.type, size: file.size, path },
-    };
-    const list = ((await kv.get(k.messages(user.id))) ?? []) as any[];
-    list.push(userMsg);
-    await kv.set(k.messages(user.id), list);
+    const { data: profile } = await admin.from("profiles").select("name").eq("id", user.id).maybeSingle();
+    const { data: msg } = await admin.from("messages").insert({
+      user_id: user.id, from_role: "user", author: profile?.name ?? "Vous", body: caption, read: true,
+    }).select("*").maybeSingle();
+    await admin.from("message_attachments").insert({ message_id: msg.id, name: file.name, mime: file.type, size: file.size, path });
+    const mapped = mapMessage(msg, { name: file.name, mime: file.type, size: file.size, path });
     await Promise.all([
-      broadcast(`chat:${user.id}`, "message:new", { message: userMsg }),
-      broadcast(`admin:chat`, "message:new", { userId: user.id, message: userMsg }),
+      broadcast(`chat:${user.id}`, "message:new", { message: mapped }),
+      broadcast(`admin:chat`, "message:new", { userId: user.id, message: mapped }),
     ]);
-    return c.json({ message: userMsg });
+    return c.json({ message: mapped });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-app.post(`${PREFIX}/admin/messages/:uid/attachment`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  try {
-    const form = await c.req.formData();
-    const file = form.get("file");
-    const caption = String(form.get("caption") ?? "").trim();
-    if (!(file instanceof File)) return c.json({ error: "Fichier manquant" }, 400);
-    if (file.size > MSG_MAX_BYTES) return c.json({ error: "Fichier trop volumineux (max 10 Mo)" }, 413);
-    if (!MSG_ALLOWED_MIME.test(file.type)) return c.json({ error: `Type non autorisé: ${file.type}` }, 415);
-    const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(-80);
-    const path = `${uid}/admin_${Date.now()}_${safeName}`;
-    const { error: upErr } = await admin.storage.from(MSG_BUCKET).upload(path, file, { contentType: file.type, upsert: false });
-    if (upErr) return c.json({ error: `Upload échoué: ${upErr.message}` }, 500);
-    const msg = {
-      id: `m_${Date.now()}`,
-      from: "conseiller",
-      author: `${r.admin.username} (IPPOO)`,
-      body: caption,
-      createdAt: new Date().toISOString(),
-      read: false,
-      attachment: { name: file.name, mime: file.type, size: file.size, path },
-    };
-    const list = ((await kv.get(k.messages(uid))) ?? []) as any[];
-    list.push(msg);
-    await kv.set(k.messages(uid), list);
-    const notifs = ((await kv.get(k.notifications(uid))) ?? []) as any[];
-    await kv.set(k.notifications(uid), notify(notifs, "Nouveau message conseiller", `Pièce jointe : ${file.name}`, "info"));
-    await audit(uid, "message.admin_attachment", { by: r.admin.username, name: file.name, size: file.size });
-    await Promise.all([
-      broadcast(`chat:${uid}`, "message:new", { message: msg }),
-      broadcast(`admin:chat`, "message:new", { userId: uid, message: msg }),
-    ]);
-    return c.json({ message: msg });
-  } catch (err) {
-    return c.json({ error: `${err}` }, 500);
-  }
-});
-
-// Signed URL for a message attachment. User can fetch their own; admin can fetch any.
 app.get(`${PREFIX}/messages/attachment-url`, async (c) => {
   const path = c.req.query("path") ?? "";
   if (!path) return c.json({ error: "path manquant" }, 400);
@@ -1021,81 +1000,16 @@ app.get(`${PREFIX}/messages/attachment-url`, async (c) => {
   return c.json({ url: data.signedUrl, expiresIn: 300 });
 });
 
-// Client marks all advisor messages as read. Broadcasts to admin so the
-// unread badge drops instantly.
-app.post(`${PREFIX}/messages/read`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const list = ((await kv.get(k.messages(user.id))) ?? []) as any[];
-  let changed = 0;
-  const marked = list.map((m) => {
-    if (m.from === "conseiller" && !m.read) { changed++; return { ...m, read: true, readAt: new Date().toISOString() }; }
-    return m;
-  });
-  if (changed > 0) {
-    await kv.set(k.messages(user.id), marked);
-    await broadcast(`admin:chat`, "message:read", { userId: user.id, count: changed, at: new Date().toISOString() });
-  }
-  return c.json({ ok: true, marked: changed });
-});
+// ============================================================
+// SUBSCRIBE (new contract)
+// ============================================================
+const BILLING = {
+  dailyPerProduct: 500,
+  daysPerMonth: 31,
+  accountFee: 1000,
+  cardFee: 500,
+};
 
-// Admin marks the thread as read (or any single message). Broadcasts to the
-// user's channel so the ✓✓ indicator lights up live on their messages.
-app.post(`${PREFIX}/admin/messages/:uid/read`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  const list = ((await kv.get(k.messages(uid))) ?? []) as any[];
-  let changed = 0;
-  const marked = list.map((m) => {
-    if (m.from === "user" && !m.read) { changed++; return { ...m, read: true, readAt: new Date().toISOString() }; }
-    return m;
-  });
-  if (changed > 0) {
-    await kv.set(k.messages(uid), marked);
-    await broadcast(`chat:${uid}`, "message:read", { count: changed, at: new Date().toISOString() });
-  }
-  return c.json({ ok: true, marked: changed });
-});
-
-app.post(`${PREFIX}/messages`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const limited = await guardRate(c, "msg", user.id, 30, 600);
-  if (limited) return limited;
-  try {
-    const parsed = await parseBody(c, MessageCreateSchema);
-    if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
-    const content = parsed.data.content.trim();
-    if (!content) return c.json({ error: "Message vide" }, 400);
-    const profile = (await kv.get(k.profile(user.id))) ?? {};
-    const now = new Date().toISOString();
-    const replyToId = typeof (parsed.data as any).replyToId === "string" ? (parsed.data as any).replyToId : undefined;
-    const userMsg: any = {
-      id: `m_${Date.now()}`,
-      from: "user",
-      author: profile.name ?? "Vous",
-      body: content.trim(),
-      createdAt: now,
-      read: true,
-    };
-    if (replyToId) userMsg.replyToId = replyToId;
-    const list = (await kv.get(k.messages(user.id))) ?? [];
-    list.push(userMsg);
-    await kv.set(k.messages(user.id), list);
-    // Push to the user's own channel (other client tabs) AND to the admin queue.
-    await Promise.all([
-      broadcast(`chat:${user.id}`, "message:new", { message: userMsg }),
-      broadcast(`admin:chat`, "message:new", { userId: user.id, message: userMsg }),
-    ]);
-    return c.json({ messages: [userMsg] });
-  } catch (err) {
-    console.log(`Message create error for ${user.id}: ${err}`);
-    return c.json({ error: `Erreur lors de l'envoi: ${err}` }, 500);
-  }
-});
-
-// ---- SUBSCRIBE TO NEW CONTRACT ----
 app.post(`${PREFIX}/subscribe`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -1105,40 +1019,30 @@ app.post(`${PREFIX}/subscribe`, async (c) => {
     const parsed = await parseBody(c, SubscribeSchema);
     if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
     const { product, frequency } = parsed.data;
-    const now = new Date().toISOString();
-    const contract = {
-      id: `c_${Date.now()}`,
-      product,
-      status: "active",
-      startDate: now,
-      endDate: new Date(Date.now() + 365 * 86400000).toISOString(),
+    const now = new Date();
+    const { data: contract } = await admin.from("contracts").insert({
+      user_id: user.id, product, status: "active",
+      start_date: now.toISOString(),
+      end_date: new Date(now.getTime() + 365 * 86400000).toISOString(),
       premium: BILLING.dailyPerProduct * BILLING.daysPerMonth,
-      currency: "XOF",
-      frequency: frequency ?? "mensuel",
-      autoDebit: true,
-      nextBillingDate: nextBillingFromNow(),
-    };
-    const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-    contracts.unshift(contract);
-    await kv.set(k.contracts(user.id), contracts);
-    const notifications = (await kv.get(k.notifications(user.id))) ?? [];
-    await kv.set(
-      k.notifications(user.id),
-      notify(notifications, "Souscription confirmée", `Votre contrat « ${product} » est actif.`, "success", "/espace-client/contrats"),
-    );
-    return c.json({ contract });
+      currency: "XOF", frequency: frequency ?? "mensuel",
+      auto_debit: true, next_billing_date: nextBillingFromNow(),
+    }).select("*").maybeSingle();
+    await addNotification(user.id, "Souscription confirmée", `Votre contrat « ${product} » est actif.`, "success");
+    return c.json({ contract: mapContract(contract) });
   } catch (err) {
-    console.log(`Subscribe error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur de souscription: ${err}` }, 500);
   }
 });
 
-// ---- SETTINGS ----
+// ============================================================
+// SETTINGS
+// ============================================================
 app.get(`${PREFIX}/settings`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const settings = (await kv.get(k.settings(user.id))) ?? { lang: "fr", notifySms: true, notifyEmail: true };
-  return c.json({ settings });
+  const { data: settings } = await admin.from("settings").select("*").eq("user_id", user.id).maybeSingle();
+  return c.json({ settings: mapSettings(settings) });
 });
 
 app.put(`${PREFIX}/settings`, async (c) => {
@@ -1146,17 +1050,20 @@ app.put(`${PREFIX}/settings`, async (c) => {
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   try {
     const updates = await c.req.json();
-    const current = (await kv.get(k.settings(user.id))) ?? {};
-    const next = { ...current, ...updates };
-    await kv.set(k.settings(user.id), next);
-    return c.json({ settings: next });
+    const patch: Record<string, any> = {};
+    if (updates.lang !== undefined) patch.lang = updates.lang;
+    if (updates.notifySms !== undefined) patch.notify_sms = updates.notifySms;
+    if (updates.notifyEmail !== undefined) patch.notify_email = updates.notifyEmail;
+    const { data: settings } = await admin.from("settings").upsert({ user_id: user.id, ...patch }).select("*").maybeSingle();
+    return c.json({ settings: mapSettings(settings) });
   } catch (err) {
-    console.log(`Settings update error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur sauvegarde paramètres: ${err}` }, 500);
   }
 });
 
-// ---- CHANGE PASSWORD ----
+// ============================================================
+// CHANGE PASSWORD
+// ============================================================
 app.post(`${PREFIX}/change-password`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -1168,61 +1075,47 @@ app.post(`${PREFIX}/change-password`, async (c) => {
     const { newPassword } = parsed.data;
     const { error: updateErr } = await admin.auth.admin.updateUserById(user.id, { password: newPassword });
     if (updateErr) {
-      console.log(`Password change error for ${user.id}: ${updateErr.message}`);
-      await audit(user.id, "password.change.failed", { reason: updateErr.message });
+      await auditLog(user.id, "password.change.failed", { reason: updateErr.message });
       return c.json({ error: updateErr.message }, 400);
     }
-    await audit(user.id, "password.change", {});
+    await auditLog(user.id, "password.change", {});
     return c.json({ ok: true });
   } catch (err) {
-    console.log(`Password change exception for ${user.id}: ${err}`);
     return c.json({ error: `Erreur changement mot de passe: ${err}` }, 500);
   }
 });
 
-// Check upcoming contract renewals and push notifications (idempotent via renewalNoticeSent flag)
+// ============================================================
+// CONTRACT RENEWALS CHECK
+// ============================================================
 app.post(`${PREFIX}/contracts/check-renewals`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   try {
-    const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-    const notifs = (await kv.get(k.notifications(user.id))) ?? [];
+    const { data: contracts } = await admin.from("contracts").select("*").eq("user_id", user.id).eq("status", "active");
     const now = Date.now();
-    const WINDOW = 30 * 86400000;
-    let changed = false;
     let pushed = 0;
-    const updated = contracts.map((ct: any) => {
-      if (ct.status !== "active" || !ct.endDate) return ct;
-      const end = new Date(ct.endDate).getTime();
+    for (const ct of contracts ?? []) {
+      if (!ct.end_date) continue;
+      const end = new Date(ct.end_date).getTime();
       const days = Math.ceil((end - now) / 86400000);
-      if (days <= 30 && days >= 0 && !ct.renewalNoticeSent) {
-        notify(
-          notifs,
-          "Échéance proche",
-          `Votre contrat « ${ct.product} » arrive à échéance dans ${days} jour${days > 1 ? "s" : ""}.`,
-          "warn",
-        );
+      if (days <= 30 && days >= 0 && !ct.renewal_notice_sent) {
+        await addNotification(user.id, "Échéance proche", `Votre contrat « ${ct.product} » arrive à échéance dans ${days} jour${days > 1 ? "s" : ""}.`, "warn");
+        await admin.from("contracts").update({ renewal_notice_sent: true }).eq("id", ct.id);
         pushed++;
-        changed = true;
-        return { ...ct, renewalNoticeSent: true };
+      } else if (days > 30 && ct.renewal_notice_sent) {
+        await admin.from("contracts").update({ renewal_notice_sent: false }).eq("id", ct.id);
       }
-      if (days > WINDOW / 86400000 && ct.renewalNoticeSent) {
-        return { ...ct, renewalNoticeSent: false };
-      }
-      return ct;
-    });
-    if (changed) {
-      await kv.set(k.contracts(user.id), updated);
-      await kv.set(k.notifications(user.id), notifs.slice(0, 50));
     }
     return c.json({ pushed });
   } catch (err) {
-    console.log(`Renewal check error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur de vérification des échéances: ${err}` }, 500);
   }
 });
 
-// 1-click renewal: extends contract by 12 months + records payment
+// ============================================================
+// RENEW CONTRACT
+// ============================================================
 app.post(`${PREFIX}/contracts/:id/renew`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -1232,135 +1125,111 @@ app.post(`${PREFIX}/contracts/:id/renew`, async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
     const phone = typeof body.phone === "string" ? body.phone : null;
-    const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-    const ct = contracts.find((c: any) => c.id === id);
+    const { data: ct } = await admin.from("contracts").select("*").eq("id", id).eq("user_id", user.id).maybeSingle();
     if (!ct) return c.json({ error: "Contrat introuvable" }, 404);
     const publicKey = Deno.env.get("KKIAPAY_PUBLIC_KEY") ?? "";
     const mode: "kkiapay" | "mock" = publicKey ? "kkiapay" : "mock";
-    const payment = {
-      id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      contractId: ct.id,
-      amount: ct.premium,
-      currency: ct.currency ?? "XOF",
-      method: "mobile_money",
-      status: "en_attente" as const,
-      purpose: "renewal" as const,
-      phone,
-      mode,
-      createdAt: new Date().toISOString(),
-    };
-    const payments = (await kv.get(k.payments(user.id))) ?? [];
-    payments.unshift(payment);
-    await kv.set(k.payments(user.id), payments);
-    await audit(user.id, "renewal.initiated", { id, premium: ct.premium, paymentId: payment.id });
-    return c.json({
-      payment,
-      kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") },
-    });
+    const { data: payment } = await admin.from("payments").insert({
+      user_id: user.id, contract_id: ct.id, amount: ct.premium,
+      currency: ct.currency ?? "XOF", method: "mobile_money",
+      status: "en_attente", purpose: "renewal",
+    }).select("*").maybeSingle();
+    await auditLog(user.id, "renewal.initiated", { id, premium: ct.premium, paymentId: payment.id });
+    return c.json({ payment: { ...mapPayment(payment), mode }, kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") } });
   } catch (err) {
-    console.log(`Renewal error for ${user.id}/${id}: ${err}`);
     return c.json({ error: `Erreur de renouvellement: ${err}` }, 500);
   }
 });
 
-// ---- REFERRAL ----
+// ============================================================
+// REFERRAL
+// ============================================================
 app.get(`${PREFIX}/referral`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  let code = await kv.get(k.referralCode(user.id));
+  const { data: profile } = await admin.from("profiles").select("referral_code, referred_by").eq("id", user.id).maybeSingle();
+  let code = profile?.referral_code;
   if (!code) {
-    const profile = (await kv.get(k.profile(user.id))) ?? {};
-    code = makeReferralCode(profile.name ?? "IPPOO");
-    await kv.set(k.referralCode(user.id), code);
-    await kv.set(k.referralByCode(code), user.id);
+    const { data: p } = await admin.from("profiles").select("name").eq("id", user.id).maybeSingle();
+    code = makeReferralCode(p?.name ?? "IPPOO");
+    await admin.from("profiles").update({ referral_code: code }).eq("id", user.id);
   }
-  const redemptions = (await kv.get(k.referralRedemptions(user.id))) ?? [];
-  return c.json({ code, count: redemptions.length });
+  const { count } = await admin.from("profiles").select("*", { count: "exact", head: true }).eq("referred_by", user.id);
+  return c.json({ code, count: count ?? 0 });
 });
 
-// ---- AUDIT LOG ----
+// ============================================================
+// AUDIT LOG
+// ============================================================
 app.get(`${PREFIX}/audit`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const entries = (await kv.get(k.audit(user.id))) ?? [];
-  return c.json({ entries });
+  const { data: entries } = await admin.from("audit_log").select("*").eq("user_id", user.id).order("created_at", { ascending: false }).limit(200);
+  return c.json({
+    entries: (entries ?? []).map((e: any) => ({ id: e.id, action: e.action, meta: e.meta, at: e.created_at })),
+  });
 });
 
-// ---- ACCOUNT DELETION (RGPD, soft-delete with 30-day grace) ----
+// ============================================================
+// ACCOUNT DELETION (RGPD)
+// ============================================================
 app.post(`${PREFIX}/account/delete`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   const limited = await guardRate(c, "acct-del", user.id, 5, 3600);
   if (limited) return limited;
   const scheduledFor = new Date(Date.now() + 30 * 86400000).toISOString();
-  await kv.set(k.accountDeletion(user.id), { requestedAt: new Date().toISOString(), scheduledFor });
-  await audit(user.id, "account.delete.request", { scheduledFor });
-  const notifications = (await kv.get(k.notifications(user.id))) ?? [];
-  notify(notifications, "Suppression de compte programmée", `Votre compte sera supprimé le ${new Date(scheduledFor).toLocaleDateString("fr-FR")}. Connectez-vous pour annuler.`, "warn");
-  await kv.set(k.notifications(user.id), notifications.slice(0, 100));
+  await admin.from("system_config").upsert({
+    key: `account:deletion:${user.id}`,
+    value: { requestedAt: new Date().toISOString(), scheduledFor },
+  });
+  await auditLog(user.id, "account.delete.request", { scheduledFor });
+  await addNotification(user.id, "Suppression de compte programmée", `Votre compte sera supprimé le ${new Date(scheduledFor).toLocaleDateString("fr-FR")}. Connectez-vous pour annuler.`, "warn");
   return c.json({ ok: true, scheduledFor });
 });
 
 app.delete(`${PREFIX}/account/delete`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  await kv.del(k.accountDeletion(user.id));
-  await audit(user.id, "account.delete.cancel", {});
+  await admin.from("system_config").delete().eq("key", `account:deletion:${user.id}`);
+  await auditLog(user.id, "account.delete.cancel", {});
   return c.json({ ok: true });
 });
 
-// RGPD data portability: returns a JSON dump of all user data so the user
-// can keep a copy before requesting deletion.
 app.get(`${PREFIX}/account/export`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const [profile, contracts, claims, payments, beneficiaries, documents, notifications, messages, settings, auditEntries, referralCode] =
-    await Promise.all([
-      kv.get(k.profile(user.id)),
-      kv.get(k.contracts(user.id)),
-      kv.get(k.claims(user.id)),
-      kv.get(k.payments(user.id)),
-      kv.get(k.beneficiaries(user.id)),
-      kv.get(k.documents(user.id)),
-      kv.get(k.notifications(user.id)),
-      kv.get(k.messages(user.id)),
-      kv.get(k.settings(user.id)),
-      kv.get(k.audit(user.id)),
-      kv.get(k.referralCode(user.id)),
-    ]);
-  await audit(user.id, "account.export", {});
+  const [{ data: profile }, { data: contracts }, { data: claims }, { data: payments },
+    { data: beneficiaries }, { data: notifications }, { data: messages },
+    { data: settings }, { data: audit }] = await Promise.all([
+    admin.from("profiles").select("*").eq("id", user.id).maybeSingle(),
+    admin.from("contracts").select("*").eq("user_id", user.id),
+    admin.from("claims").select("*").eq("user_id", user.id),
+    admin.from("payments").select("*").eq("user_id", user.id),
+    admin.from("beneficiaries").select("*").eq("user_id", user.id),
+    admin.from("notifications").select("*").eq("user_id", user.id),
+    admin.from("messages").select("*").eq("user_id", user.id),
+    admin.from("settings").select("*").eq("user_id", user.id).maybeSingle(),
+    admin.from("audit_log").select("*").eq("user_id", user.id).order("created_at", { ascending: false }).limit(200),
+  ]);
+  await auditLog(user.id, "account.export", {});
   return c.json({
     exportedAt: new Date().toISOString(),
     user: { id: user.id, email: user.email },
-    profile,
-    contracts,
-    claims,
-    payments,
-    beneficiaries,
-    documents,
-    notifications,
-    messages,
-    settings,
-    audit: auditEntries,
-    referralCode,
+    profile: mapProfile(profile),
+    contracts: (contracts ?? []).map(mapContract),
+    claims: (claims ?? []).map((cl: any) => mapClaim(cl)),
+    payments: (payments ?? []).map(mapPayment),
+    beneficiaries: (beneficiaries ?? []).map(mapBeneficiary),
+    notifications: (notifications ?? []).map(mapNotification),
+    messages: (messages ?? []).map((m: any) => mapMessage(m)),
+    settings: mapSettings(settings),
+    audit: (audit ?? []).map((e: any) => ({ id: e.id, action: e.action, meta: e.meta, at: e.created_at })),
   });
 });
 
-// Hard-delete: wipes all KV keys, storage files, and the auth user. Used by
-// the admin sweep route (after the 30-day grace period) and the user-driven
-// immediate-delete route.
 async function hardDeleteUser(uid: string): Promise<void> {
-  const profile = await kv.get(k.profile(uid));
-  const keys = [
-    k.profile(uid), k.contracts(uid), k.claims(uid), k.payments(uid),
-    k.beneficiaries(uid), k.documents(uid), k.notifications(uid), k.messages(uid),
-    k.settings(uid), k.audit(uid), k.referralCode(uid), k.accountDeletion(uid),
-    k.webauthnCreds(uid), k.webauthnChallenge(`reg:${uid}`),
-  ];
-  if (profile?.email) keys.push(k.emailToUid(profile.email));
-  if (profile?.memberNumber) keys.push(k.memberByNumber(profile.memberNumber));
-  if (profile?.referralCode) keys.push(k.referralByCode(profile.referralCode));
-  try { await kv.mdel(keys); } catch (err) { console.log(`hardDelete kv error ${uid}: ${err}`); }
+  try { await admin.from("profiles").delete().eq("id", uid); } catch (err) { console.log(`hardDelete profiles error ${uid}: ${err}`); }
   try {
     const { data: files } = await admin.storage.from(BUCKET).list(uid, { limit: 1000 });
     if (files && files.length) {
@@ -1377,7 +1246,6 @@ async function hardDeleteUser(uid: string): Promise<void> {
   try { await admin.auth.admin.deleteUser(uid); } catch (err) { console.log(`hardDelete auth error ${uid}: ${err}`); }
 }
 
-// User-driven immediate purge (skips the 30-day grace; consent already given).
 app.post(`${PREFIX}/account/delete-now`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
@@ -1387,17 +1255,11 @@ app.post(`${PREFIX}/account/delete-now`, async (c) => {
   return c.json({ ok: true });
 });
 
-// Admin sweep: deletes accounts whose scheduledFor is past. Can be called by
-// a cron job or manually by an admin from the admin portal.
 app.post(`${PREFIX}/admin/account/sweep`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "account:deletion:%");
-    if (error) return c.json({ error: error.message }, 500);
+    const { data } = await admin.from("system_config").select("key, value").like("key", "account:deletion:%");
     const now = Date.now();
     const deleted: string[] = [];
     for (const row of data ?? []) {
@@ -1411,52 +1273,34 @@ app.post(`${PREFIX}/admin/account/sweep`, async (c) => {
     }
     return c.json({ deleted: deleted.length, ids: deleted });
   } catch (err) {
-    console.log(`Account sweep error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- BILLING & MEMBER CARD ----
-const BILLING = {
-  dailyPerProduct: 500,
-  daysPerMonth: 31,
-  accountFee: 1000,
-  cardFee: 500,
-};
-
-function computeBilling(contracts: any[], profile: any) {
+// ============================================================
+// BILLING & MEMBER CARD
+// ============================================================
+async function computeBilling(userId: string) {
+  const { data: contracts } = await admin.from("contracts").select("*").eq("user_id", userId).eq("status", "active");
+  const { data: profile } = await admin.from("profiles").select("card_active").eq("id", userId).maybeSingle();
   const perProduct = BILLING.dailyPerProduct * BILLING.daysPerMonth;
-  const active = (contracts ?? []).filter((c) => c.status === "active");
-  const items: any[] = active.map((c) => ({
-    kind: "insurance",
-    label: `Assurance — ${c.product}`,
-    contractId: c.id,
-    perDay: BILLING.dailyPerProduct,
-    days: BILLING.daysPerMonth,
-    amount: perProduct,
+  const active = contracts ?? [];
+  const items: any[] = active.map((c: any) => ({
+    kind: "insurance", label: `Assurance — ${c.product}`, contractId: c.id,
+    perDay: BILLING.dailyPerProduct, days: BILLING.daysPerMonth, amount: perProduct,
   }));
   items.push({ kind: "account_fee", label: "Frais de gestion de compte", amount: BILLING.accountFee });
-  if (profile?.cardActive) {
+  if (profile?.card_active) {
     items.push({ kind: "card_fee", label: "Carte membre IPPOO", amount: BILLING.cardFee });
   }
   const total = items.reduce((s, it) => s + it.amount, 0);
-  return {
-    items,
-    total,
-    perInsurance: perProduct,
-    accountFee: BILLING.accountFee,
-    cardFee: BILLING.cardFee,
-    activeCount: active.length,
-    cycle: "mensuel",
-  };
+  return { items, total, perInsurance: perProduct, accountFee: BILLING.accountFee, cardFee: BILLING.cardFee, activeCount: active.length, cycle: "mensuel" };
 }
 
 app.get(`${PREFIX}/billing`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-  const profile = await kv.get(k.profile(user.id));
-  return c.json(computeBilling(contracts, profile));
+  return c.json(await computeBilling(user.id));
 });
 
 app.post(`${PREFIX}/member-card/activate`, async (c) => {
@@ -1465,67 +1309,42 @@ app.post(`${PREFIX}/member-card/activate`, async (c) => {
   const limited = await guardRate(c, "card", user.id, 5, 3600);
   if (limited) return limited;
   try {
-    const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-    const hasActive = contracts.some((ct: any) => ct.status === "active");
-    if (!hasActive) {
-      return c.json({ error: "Vous devez d'abord souscrire à au moins une assurance." }, 400);
-    }
-    const profile = await kv.get(k.profile(user.id));
+    const { data: contracts } = await admin.from("contracts").select("*").eq("user_id", user.id).eq("status", "active");
+    if (!contracts?.length) return c.json({ error: "Vous devez d'abord souscrire à au moins une assurance." }, 400);
+    const { data: profile } = await admin.from("profiles").select("*").eq("id", user.id).maybeSingle();
     if (!profile) return c.json({ error: "Profil introuvable" }, 404);
-    if (profile.cardActive) return c.json({ profile, payment: null });
+    if (profile.card_active) return c.json({ profile: mapProfile(profile), payment: null });
     const body = await c.req.json().catch(() => ({}));
     const phone = typeof body?.phone === "string" ? body.phone : null;
     const publicKey = Deno.env.get("KKIAPAY_PUBLIC_KEY") ?? "";
     const mode: "kkiapay" | "mock" = publicKey ? "kkiapay" : "mock";
-    const payment = {
-      id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      contractId: null,
-      amount: BILLING.cardFee,
-      currency: "XOF",
-      method: "mobile_money",
-      status: "en_attente" as const,
-      purpose: "card_activation" as const,
-      label: "Activation carte membre IPPOO",
-      phone,
-      mode,
-      createdAt: new Date().toISOString(),
-    };
-    const payments = (await kv.get(k.payments(user.id))) ?? [];
-    payments.unshift(payment);
-    await kv.set(k.payments(user.id), payments);
-    await audit(user.id, "member-card.activate.initiated", { paymentId: payment.id });
-    return c.json({
-      profile,
-      payment,
-      kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") },
-    });
+    const { data: payment } = await admin.from("payments").insert({
+      user_id: user.id, contract_id: null, amount: BILLING.cardFee,
+      currency: "XOF", method: "mobile_money", status: "en_attente",
+      purpose: "card_activation", label: "Activation carte membre IPPOO",
+    }).select("*").maybeSingle();
+    await auditLog(user.id, "member-card.activate.initiated", { paymentId: payment.id });
+    return c.json({ profile: mapProfile(profile), payment: { ...mapPayment(payment), mode }, kkiapay: { publicKey, sandbox: !Deno.env.get("KKIAPAY_SECRET") } });
   } catch (err) {
-    console.log(`Card activation error for ${user.id}: ${err}`);
     return c.json({ error: `Erreur d'activation: ${err}` }, 500);
   }
 });
 
-// ---- QR LOGIN: issue & verify signed QR tokens ----
+// ============================================================
+// QR LOGIN
+// ============================================================
 app.get(`${PREFIX}/me/qr-token`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const profile = await kv.get(k.profile(user.id));
-  if (!profile?.memberNumber) return c.json({ error: "Profil incomplet" }, 400);
-  if (!profile.cardActive) return c.json({ error: "Carte membre non activée", code: "card_inactive" }, 403);
-  const contracts = (await kv.get(k.contracts(user.id))) ?? [];
-  if (!contracts.some((ct: any) => ct.status === "active")) {
-    return c.json({ error: "Aucune souscription active", code: "no_subscription" }, 403);
-  }
-  const token = await signToken({
-    v: 1,
-    sub: user.id,
-    mn: profile.memberNumber,
-    iat: Math.floor(Date.now() / 1000),
-  });
-  return c.json({ token, memberNumber: profile.memberNumber });
+  const { data: profile } = await admin.from("profiles").select("member_number, card_active").eq("id", user.id).maybeSingle();
+  if (!profile?.member_number) return c.json({ error: "Profil incomplet" }, 400);
+  if (!profile.card_active) return c.json({ error: "Carte membre non activée", code: "card_inactive" }, 403);
+  const { data: contracts } = await admin.from("contracts").select("id").eq("user_id", user.id).eq("status", "active");
+  if (!contracts?.length) return c.json({ error: "Aucune souscription active", code: "no_subscription" }, 403);
+  const token = await signToken({ v: 1, sub: user.id, mn: profile.member_number, iat: Math.floor(Date.now() / 1000) });
+  return c.json({ token, memberNumber: profile.member_number });
 });
 
-// Exchange QR token → magic link (client completes via supabase.auth.verifyOtp)
 app.post(`${PREFIX}/auth/qr-login`, async (c) => {
   try {
     const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
@@ -1535,44 +1354,36 @@ app.post(`${PREFIX}/auth/qr-login`, async (c) => {
     if (!token || typeof token !== "string") return c.json({ error: "Token manquant" }, 400);
     const payload = await verifyToken<{ sub: string; mn: string }>(token);
     if (!payload?.sub) return c.json({ error: "QR invalide ou falsifié" }, 401);
-    const profile = await kv.get(k.profile(payload.sub));
-    if (!profile?.email || profile.memberNumber !== payload.mn) {
-      return c.json({ error: "Identifiants membres invalides" }, 401);
-    }
-    const { data, error: linkErr } = await admin.auth.admin.generateLink({
-      type: "magiclink", email: profile.email,
-    });
+    const { data: profile } = await admin.from("profiles").select("email, member_number").eq("id", payload.sub).maybeSingle();
+    if (!profile?.email || profile.member_number !== payload.mn) return c.json({ error: "Identifiants membres invalides" }, 401);
+    const { data, error: linkErr } = await admin.auth.admin.generateLink({ type: "magiclink", email: profile.email });
     if (linkErr) return c.json({ error: linkErr.message }, 500);
-    await audit(payload.sub, "auth.qr.login", { ip });
-    return c.json({
-      email: profile.email,
-      tokenHash: data.properties?.hashed_token,
-      actionLink: data.properties?.action_link,
-    });
+    await auditLog(payload.sub, "auth.qr.login", { ip });
+    return c.json({ email: profile.email, tokenHash: data.properties?.hashed_token, actionLink: data.properties?.action_link });
   } catch (err) {
-    console.log(`QR login error: ${err}`);
     return c.json({ error: `Erreur QR: ${err}` }, 500);
   }
 });
 
-// ---- WEBAUTHN (biometric) ----
+// ============================================================
+// WEBAUTHN (biometric)
+// ============================================================
 app.post(`${PREFIX}/auth/webauthn/register/options`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const profile = await kv.get(k.profile(user.id));
-  const existing = (await kv.get(k.webauthnCreds(user.id))) ?? [];
+  const { data: profile } = await admin.from("profiles").select("email, name").eq("id", user.id).maybeSingle();
+  const { data: creds } = await admin.from("webauthn_credentials").select("id").eq("user_id", user.id);
   const { rpID } = webauthnContext(c);
   const opts = await generateRegistrationOptions({
-    rpName: WEBAUTHN_RP_NAME,
-    rpID,
+    rpName: WEBAUTHN_RP_NAME, rpID,
     userID: enc.encode(user.id),
     userName: profile?.email ?? user.email ?? user.id,
     userDisplayName: profile?.name ?? "Membre IPPOO",
     attestationType: "none",
     authenticatorSelection: { userVerification: "preferred", residentKey: "preferred" },
-    excludeCredentials: existing.map((c: any) => ({ id: c.id, type: "public-key" })),
+    excludeCredentials: (creds ?? []).map((c: any) => ({ id: c.id, type: "public-key" })),
   });
-  await kv.set(k.webauthnChallenge(`reg:${user.id}`), { challenge: opts.challenge, at: Date.now() });
+  await admin.from("system_config").upsert({ key: `webauthn:chal:reg:${user.id}`, value: { challenge: opts.challenge, at: Date.now() } });
   return c.json(opts);
 });
 
@@ -1583,33 +1394,24 @@ app.post(`${PREFIX}/auth/webauthn/register/verify`, async (c) => {
   if (limited) return limited;
   try {
     const body = await c.req.json();
-    const stored = await kv.get(k.webauthnChallenge(`reg:${user.id}`));
-    if (!stored?.challenge) return c.json({ error: "Aucun défi en cours" }, 400);
+    const { data: stored } = await admin.from("system_config").select("value").eq("key", `webauthn:chal:reg:${user.id}`).maybeSingle();
+    if (!stored?.value?.challenge) return c.json({ error: "Aucun défi en cours" }, 400);
     const { origin, rpID } = webauthnContext(c);
     const verification = await verifyRegistrationResponse({
-      response: body.response,
-      expectedChallenge: stored.challenge,
-      expectedOrigin: origin,
-      expectedRPID: rpID,
-      requireUserVerification: false,
+      response: body.response, expectedChallenge: stored.value.challenge,
+      expectedOrigin: origin, expectedRPID: rpID, requireUserVerification: false,
     });
-    if (!verification.verified || !verification.registrationInfo) {
-      return c.json({ error: "Vérification échouée" }, 400);
-    }
+    if (!verification.verified || !verification.registrationInfo) return c.json({ error: "Vérification échouée" }, 400);
     const { credential } = verification.registrationInfo as any;
-    const creds = (await kv.get(k.webauthnCreds(user.id))) ?? [];
-    creds.push({
-      id: credential.id,
-      publicKey: b64urlEncode(credential.publicKey),
+    await admin.from("webauthn_credentials").insert({
+      id: credential.id, user_id: user.id,
+      public_key: b64urlEncode(credential.publicKey),
       counter: credential.counter ?? 0,
       transports: body.response?.response?.transports ?? [],
-      createdAt: new Date().toISOString(),
     });
-    await kv.set(k.webauthnCreds(user.id), creds);
-    await audit(user.id, "auth.webauthn.register", {});
+    await auditLog(user.id, "auth.webauthn.register", {});
     return c.json({ ok: true });
   } catch (err) {
-    console.log(`WebAuthn register verify error: ${err}`);
     return c.json({ error: `Erreur d'enregistrement biométrique: ${err}` }, 500);
   }
 });
@@ -1618,20 +1420,20 @@ app.post(`${PREFIX}/auth/webauthn/login/options`, async (c) => {
   try {
     const { email } = (await c.req.json()) ?? {};
     if (!email) return c.json({ error: "Email requis" }, 400);
-    const uid = await kv.get(k.emailToUid(email));
-    if (!uid) return c.json({ error: "Aucun compte trouvé" }, 404);
-    const creds = (await kv.get(k.webauthnCreds(uid))) ?? [];
-    if (!creds.length) return c.json({ error: "Aucune empreinte enregistrée" }, 404);
+    const { data: profile } = await admin.from("profiles").select("id").eq("email", email).maybeSingle();
+    if (!profile?.id) return c.json({ error: "Aucun compte trouvé" }, 404);
+    const uid = profile.id;
+    const { data: creds } = await admin.from("webauthn_credentials").select("*").eq("user_id", uid);
+    if (!creds?.length) return c.json({ error: "Aucune empreinte enregistrée" }, 404);
     const { rpID } = webauthnContext(c);
     const opts = await generateAuthenticationOptions({
       rpID,
       allowCredentials: creds.map((c: any) => ({ id: c.id, type: "public-key", transports: c.transports })),
       userVerification: "preferred",
     });
-    await kv.set(k.webauthnChallenge(`auth:${uid}`), { challenge: opts.challenge, at: Date.now() });
+    await admin.from("system_config").upsert({ key: `webauthn:chal:auth:${uid}`, value: { challenge: opts.challenge, at: Date.now() } });
     return c.json({ ...opts, _uid: uid });
   } catch (err) {
-    console.log(`WebAuthn auth options error: ${err}`);
     return c.json({ error: `Erreur: ${err}` }, 500);
   }
 });
@@ -1642,42 +1444,28 @@ app.post(`${PREFIX}/auth/webauthn/login/verify`, async (c) => {
     const allowed = await rateLimit(`biolog:${ip}`, 10, 600);
     if (!allowed) return c.json({ error: "Trop de tentatives, patientez." }, 429);
     const { email, response } = (await c.req.json()) ?? {};
-    const uid = await kv.get(k.emailToUid(email));
-    if (!uid) return c.json({ error: "Compte introuvable" }, 404);
-    const stored = await kv.get(k.webauthnChallenge(`auth:${uid}`));
-    if (!stored?.challenge) return c.json({ error: "Aucun défi en cours" }, 400);
-    const creds = (await kv.get(k.webauthnCreds(uid))) ?? [];
-    const cred = creds.find((c: any) => c.id === response.id);
+    const { data: profile } = await admin.from("profiles").select("id, email").eq("email", email).maybeSingle();
+    if (!profile?.id) return c.json({ error: "Compte introuvable" }, 404);
+    const uid = profile.id;
+    const { data: storedConfig } = await admin.from("system_config").select("value").eq("key", `webauthn:chal:auth:${uid}`).maybeSingle();
+    if (!storedConfig?.value?.challenge) return c.json({ error: "Aucun défi en cours" }, 400);
+    const { data: creds } = await admin.from("webauthn_credentials").select("*").eq("user_id", uid);
+    const cred = (creds ?? []).find((c: any) => c.id === response.id);
     if (!cred) return c.json({ error: "Empreinte inconnue" }, 404);
     const { origin, rpID } = webauthnContext(c);
     const verification = await verifyAuthenticationResponse({
-      response,
-      expectedChallenge: stored.challenge,
-      expectedOrigin: origin,
-      expectedRPID: rpID,
-      credential: {
-        id: cred.id,
-        publicKey: b64urlDecode(cred.publicKey),
-        counter: cred.counter,
-        transports: cred.transports,
-      },
+      response, expectedChallenge: storedConfig.value.challenge,
+      expectedOrigin: origin, expectedRPID: rpID,
+      credential: { id: cred.id, publicKey: b64urlDecode(cred.public_key), counter: cred.counter, transports: cred.transports },
       requireUserVerification: false,
     });
     if (!verification.verified) return c.json({ error: "Empreinte rejetée" }, 401);
-    cred.counter = verification.authenticationInfo.newCounter;
-    await kv.set(k.webauthnCreds(uid), creds);
-    const profile = await kv.get(k.profile(uid));
-    const { data, error: linkErr } = await admin.auth.admin.generateLink({
-      type: "magiclink", email: profile.email,
-    });
+    await admin.from("webauthn_credentials").update({ counter: verification.authenticationInfo.newCounter }).eq("id", cred.id);
+    const { data, error: linkErr } = await admin.auth.admin.generateLink({ type: "magiclink", email: profile.email });
     if (linkErr) return c.json({ error: linkErr.message }, 500);
-    await audit(uid, "auth.webauthn.login", { ip });
-    return c.json({
-      email: profile.email,
-      tokenHash: data.properties?.hashed_token,
-    });
+    await auditLog(uid, "auth.webauthn.login", { ip });
+    return c.json({ email: profile.email, tokenHash: data.properties?.hashed_token });
   } catch (err) {
-    console.log(`WebAuthn auth verify error: ${err}`);
     return c.json({ error: `Erreur de vérification biométrique: ${err}` }, 500);
   }
 });
@@ -1685,25 +1473,22 @@ app.post(`${PREFIX}/auth/webauthn/login/verify`, async (c) => {
 app.get(`${PREFIX}/auth/webauthn/status`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const creds = (await kv.get(k.webauthnCreds(user.id))) ?? [];
-  return c.json({ count: creds.length, devices: creds.map((c: any) => ({ id: c.id, createdAt: c.createdAt })) });
+  const { data: creds } = await admin.from("webauthn_credentials").select("id, created_at").eq("user_id", user.id);
+  return c.json({ count: (creds ?? []).length, devices: (creds ?? []).map((c: any) => ({ id: c.id, createdAt: c.created_at })) });
 });
 
 app.delete(`${PREFIX}/auth/webauthn/:credId`, async (c) => {
   const { user, error } = await requireUser(c);
   if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
   const credId = c.req.param("credId");
-  const creds = ((await kv.get(k.webauthnCreds(user.id))) ?? []).filter((c: any) => c.id !== credId);
-  await kv.set(k.webauthnCreds(user.id), creds);
-  await audit(user.id, "auth.webauthn.remove", { credId });
+  await admin.from("webauthn_credentials").delete().eq("id", credId).eq("user_id", user.id);
+  await auditLog(user.id, "auth.webauthn.remove", { credId });
   return c.json({ ok: true });
 });
 
-// ---- ADMIN ----
-// Admin auth is fully isolated from user auth: credentials in env vars
-// (ADMIN_USERNAME / ADMIN_PASSWORD), HMAC-signed session token, X-Admin-Token
-// header. The Supabase users table is NEVER consulted for admin access.
-
+// ============================================================
+// ADMIN
+// ============================================================
 app.post(`${PREFIX}/admin/login`, async (c) => {
   const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "anon";
   const limited = await guardRate(c, `admin-login:${ip}`, 5, 600);
@@ -1712,12 +1497,8 @@ app.post(`${PREFIX}/admin/login`, async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const username = (body.username ?? "").toString().trim();
     const password = (body.password ?? "").toString();
-    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) {
-      return c.json({ error: "Back office non configuré: définissez ADMIN_USERNAME et ADMIN_PASSWORD." }, 503);
-    }
-    if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
-      return c.json({ error: "Identifiants invalides" }, 401);
-    }
+    if (!ADMIN_USERNAME || !ADMIN_PASSWORD) return c.json({ error: "Back office non configuré." }, 503);
+    if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) return c.json({ error: "Identifiants invalides" }, 401);
     const exp = Math.floor(Date.now() / 1000) + ADMIN_TOKEN_TTL_SEC;
     const token = await signToken({ kind: "admin", username, iat: Math.floor(Date.now() / 1000), exp });
     return c.json({ token, username, expiresAt: exp * 1000 });
@@ -1736,29 +1517,19 @@ app.get(`${PREFIX}/admin/claims`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "claims:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const flat: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("claims:".length);
-      const profile = (await kv.get(k.profile(uid))) ?? {};
-      for (const cl of (row.value ?? []) as any[]) {
-        flat.push({
-          ...cl,
-          userId: uid,
-          userEmail: profile.email ?? "",
-          userName: profile.name ?? "",
-          memberNumber: profile.memberNumber ?? "",
-        });
-      }
-    }
-    flat.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-    return c.json({ claims: flat });
+    const { data } = await admin.from("claims").select("*, profiles(email, name, member_number), claim_attachments(*)").order("created_at", { ascending: false });
+    const claims = (data ?? []).map((cl: any) => ({
+      ...mapClaim(cl, cl.claim_attachments ?? []),
+      userId: cl.user_id,
+      userEmail: cl.profiles?.email ?? "",
+      userName: cl.profiles?.name ?? "",
+      memberNumber: cl.profiles?.member_number ?? "",
+      adminNote: cl.admin_note,
+      decidedAt: cl.decided_at,
+      decidedBy: cl.decided_by,
+    }));
+    return c.json({ claims });
   } catch (err) {
-    console.log(`Admin claims list error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
@@ -1772,24 +1543,16 @@ app.post(`${PREFIX}/admin/claims/:userId/:claimId/status`, async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const status = body.status as string;
     const note = (body.note as string) ?? "";
-    if (!["en_cours", "valide", "rejete", "regle"].includes(status)) {
-      return c.json({ error: "Statut invalide" }, 400);
-    }
-    const claims = (await kv.get(k.claims(userId))) ?? [];
-    const idx = claims.findIndex((cl: any) => cl.id === claimId);
-    if (idx === -1) return c.json({ error: "Sinistre introuvable" }, 404);
-    claims[idx] = { ...claims[idx], status, adminNote: note, decidedAt: new Date().toISOString(), decidedBy: r.admin.username };
-    await kv.set(k.claims(userId), claims);
-    const notifs = (await kv.get(k.notifications(userId))) ?? [];
+    if (!["en_cours", "valide", "rejete", "regle"].includes(status)) return c.json({ error: "Statut invalide" }, 400);
+    const { data: claim } = await admin.from("claims").update({
+      status, admin_note: note, decided_at: new Date().toISOString(), decided_by: r.admin.username,
+    }).eq("id", claimId).eq("user_id", userId).select("*").maybeSingle();
+    if (!claim) return c.json({ error: "Sinistre introuvable" }, 404);
     const label = status === "valide" ? "validé" : status === "rejete" ? "rejeté" : status === "regle" ? "réglé" : "mis à jour";
-    await kv.set(
-      k.notifications(userId),
-      notify(notifs, "Sinistre " + label, `Votre sinistre « ${claims[idx].type} » a été ${label}.`, status === "rejete" ? "warn" : "success"),
-    );
-    await audit(userId, "admin.claim.status", { claimId, status, by: r.admin.username });
-    return c.json({ claim: claims[idx] });
+    await addNotification(userId, `Sinistre ${label}`, `Votre sinistre « ${claim.type} » a été ${label}.`, status === "rejete" ? "warn" : "success");
+    await auditLog(userId, "admin.claim.status", { claimId, status, by: r.admin.username });
+    return c.json({ claim: mapClaim(claim) });
   } catch (err) {
-    console.log(`Admin claim update error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
@@ -1798,72 +1561,36 @@ app.get(`${PREFIX}/admin/stats`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const [profilesRes, claimsRes, paymentsRes] = await Promise.all([
-      admin.from("kv_store_752d1a39").select("value", { count: "exact", head: true }).like("key", "profile:%"),
-      admin.from("kv_store_752d1a39").select("key, value").like("key", "claims:%"),
-      admin.from("kv_store_752d1a39").select("key, value").like("key", "payments:%"),
+    const [{ count: usersCount }, { data: claimsData }, { data: paymentsData }] = await Promise.all([
+      admin.from("profiles").select("*", { count: "exact", head: true }),
+      admin.from("claims").select("status"),
+      admin.from("payments").select("amount, status").eq("status", "confirme"),
     ]);
-    let pendingClaims = 0, totalClaims = 0;
-    for (const row of claimsRes.data ?? []) for (const cl of (row.value ?? []) as any[]) {
-      totalClaims++;
-      if (cl.status === "en_cours") pendingClaims++;
-    }
-    let confirmedTotal = 0;
-    for (const row of paymentsRes.data ?? []) for (const p of (row.value ?? []) as any[]) {
-      if (p.status === "confirme") confirmedTotal += p.amount ?? 0;
-    }
-    return c.json({
-      users: profilesRes.count ?? 0,
-      claims: { total: totalClaims, pending: pendingClaims },
-      revenue: confirmedTotal,
-    });
+    const totalClaims = claimsData?.length ?? 0;
+    const pendingClaims = (claimsData ?? []).filter((c: any) => c.status === "en_cours").length;
+    const revenue = (paymentsData ?? []).reduce((s: number, p: any) => s + (p.amount ?? 0), 0);
+    return c.json({ users: usersCount ?? 0, claims: { total: totalClaims, pending: pendingClaims }, revenue });
   } catch (err) {
-    console.log(`Admin stats error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- ADMIN: MEMBERS ----
 app.get(`${PREFIX}/admin/members`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "profile:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const members: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("profile:".length);
-      const p = (row.value ?? {}) as any;
-      const [contracts, claims, payments] = await Promise.all([
-        kv.get(k.contracts(uid)).then((v) => (v ?? []) as any[]),
-        kv.get(k.claims(uid)).then((v) => (v ?? []) as any[]),
-        kv.get(k.payments(uid)).then((v) => (v ?? []) as any[]),
+    const { data: profiles } = await admin.from("profiles").select("id, email, name, phone, member_number, created_at, suspended").order("created_at", { ascending: false });
+    const members = await Promise.all((profiles ?? []).map(async (p: any) => {
+      const [{ count: activeContracts }, { count: pendingClaims }, { data: payments }] = await Promise.all([
+        admin.from("contracts").select("*", { count: "exact", head: true }).eq("user_id", p.id).eq("status", "active"),
+        admin.from("claims").select("*", { count: "exact", head: true }).eq("user_id", p.id).eq("status", "en_cours"),
+        admin.from("payments").select("amount").eq("user_id", p.id).eq("status", "confirme"),
       ]);
-      const activeContracts = contracts.filter((c: any) => c.status === "active").length;
-      const pendingClaims = claims.filter((c: any) => c.status === "en_cours").length;
-      const revenue = payments
-        .filter((p: any) => p.status === "confirme")
-        .reduce((s: number, p: any) => s + (p.amount ?? 0), 0);
-      members.push({
-        id: uid,
-        email: p.email ?? "",
-        name: p.name ?? "",
-        phone: p.phone ?? "",
-        memberNumber: p.memberNumber ?? "",
-        createdAt: p.createdAt ?? null,
-        suspended: !!p.suspended,
-        activeContracts,
-        pendingClaims,
-        revenue,
-      });
-    }
-    members.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+      const revenue = (payments ?? []).reduce((s: number, pay: any) => s + (pay.amount ?? 0), 0);
+      return { id: p.id, email: p.email, name: p.name, phone: p.phone, memberNumber: p.member_number, createdAt: p.created_at, suspended: !!p.suspended, activeContracts: activeContracts ?? 0, pendingClaims: pendingClaims ?? 0, revenue };
+    }));
     return c.json({ members });
   } catch (err) {
-    console.log(`Admin members list error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
@@ -1873,27 +1600,26 @@ app.get(`${PREFIX}/admin/member/:uid`, async (c) => {
   if (!r.admin) return c.json({ error: r.error }, r.status);
   const uid = c.req.param("uid");
   try {
-    const [profile, contracts, claims, payments, beneficiaries, notifications, settings] = await Promise.all([
-      kv.get(k.profile(uid)),
-      kv.get(k.contracts(uid)),
-      kv.get(k.claims(uid)),
-      kv.get(k.payments(uid)),
-      kv.get(k.beneficiaries(uid)),
-      kv.get(k.notifications(uid)),
-      kv.get(k.settings(uid)),
+    const [{ data: profile }, { data: contracts }, { data: claims }, { data: payments }, { data: beneficiaries }, { data: notifications }, { data: settings }] = await Promise.all([
+      admin.from("profiles").select("*").eq("id", uid).maybeSingle(),
+      admin.from("contracts").select("*").eq("user_id", uid),
+      admin.from("claims").select("*, claim_attachments(*)").eq("user_id", uid),
+      admin.from("payments").select("*").eq("user_id", uid),
+      admin.from("beneficiaries").select("*").eq("user_id", uid),
+      admin.from("notifications").select("*").eq("user_id", uid),
+      admin.from("settings").select("*").eq("user_id", uid).maybeSingle(),
     ]);
     if (!profile) return c.json({ error: "Membre introuvable" }, 404);
     return c.json({
-      profile,
-      contracts: contracts ?? [],
-      claims: claims ?? [],
-      payments: payments ?? [],
-      beneficiaries: beneficiaries ?? [],
-      notifications: notifications ?? [],
-      settings: settings ?? null,
+      profile: { ...mapProfile(profile), suspended: profile.suspended },
+      contracts: (contracts ?? []).map(mapContract),
+      claims: (claims ?? []).map((cl: any) => mapClaim(cl, cl.claim_attachments ?? [])),
+      payments: (payments ?? []).map(mapPayment),
+      beneficiaries: (beneficiaries ?? []).map(mapBeneficiary),
+      notifications: (notifications ?? []).map(mapNotification),
+      settings: mapSettings(settings),
     });
   } catch (err) {
-    console.log(`Admin member detail error: ${err}`);
     return c.json({ error: `${err}` }, 500);
   }
 });
@@ -1905,77 +1631,42 @@ app.post(`${PREFIX}/admin/member/:uid/suspend`, async (c) => {
   try {
     const body = await c.req.json().catch(() => ({}));
     const suspended = !!body.suspended;
-    const p = (await kv.get(k.profile(uid))) ?? {};
-    p.suspended = suspended;
-    await kv.set(k.profile(uid), p);
-    await audit(uid, "admin.member.suspend", { suspended, by: r.admin.username });
+    await admin.from("profiles").update({ suspended }).eq("id", uid);
+    await auditLog(uid, "admin.member.suspend", { suspended, by: r.admin.username });
     return c.json({ ok: true, suspended });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- ADMIN: CONTRACTS (flat) ----
 app.get(`${PREFIX}/admin/contracts`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "contracts:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const flat: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("contracts:".length);
-      const profile = (await kv.get(k.profile(uid))) ?? {};
-      for (const ct of (row.value ?? []) as any[]) {
-        flat.push({
-          ...ct,
-          userId: uid,
-          userEmail: profile.email ?? "",
-          userName: profile.name ?? "",
-        });
-      }
-    }
-    flat.sort((a, b) => (a.startDate < b.startDate ? 1 : -1));
-    return c.json({ contracts: flat });
+    const { data } = await admin.from("contracts").select("*, profiles(email, name)").order("start_date", { ascending: false });
+    const contracts = (data ?? []).map((ct: any) => ({
+      ...mapContract(ct), userId: ct.user_id, userEmail: ct.profiles?.email ?? "", userName: ct.profiles?.name ?? "",
+    }));
+    return c.json({ contracts });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- ADMIN: PAYMENTS (flat) ----
 app.get(`${PREFIX}/admin/payments`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "payments:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const flat: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("payments:".length);
-      const profile = (await kv.get(k.profile(uid))) ?? {};
-      for (const p of (row.value ?? []) as any[]) {
-        flat.push({
-          ...p,
-          userId: uid,
-          userEmail: profile.email ?? "",
-          userName: profile.name ?? "",
-        });
-      }
-    }
-    flat.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-    return c.json({ payments: flat });
+    const { data } = await admin.from("payments").select("*, profiles(email, name)").order("created_at", { ascending: false });
+    const payments = (data ?? []).map((p: any) => ({
+      ...mapPayment(p), userId: p.user_id, userEmail: p.profiles?.email ?? "", userName: p.profiles?.name ?? "",
+    }));
+    return c.json({ payments });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- ADMIN: BROADCAST ----
 app.post(`${PREFIX}/admin/broadcast`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
@@ -1985,26 +1676,22 @@ app.post(`${PREFIX}/admin/broadcast`, async (c) => {
     const text = (body.body ?? "").toString().trim();
     const type = ["info", "success", "warn"].includes(body.type) ? body.type : "info";
     if (!title || !text) return c.json({ error: "Titre et message requis" }, 400);
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key")
-      .like("key", "profile:%");
-    if (error) return c.json({ error: error.message }, 500);
+    const { data: profiles } = await admin.from("profiles").select("id");
     let count = 0;
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("profile:".length);
-      const notifs = (await kv.get(k.notifications(uid))) ?? [];
-      await kv.set(k.notifications(uid), notify(notifs, title, text, type));
+    for (const p of profiles ?? []) {
+      await addNotification(p.id, title, text, type);
       count++;
     }
-    await audit(`admin:${r.admin.username}`, "admin.broadcast", { title, count });
+    await auditLog(`admin:${r.admin.username}` as any, "admin.broadcast", { title, count });
     return c.json({ ok: true, recipients: count });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- SITE CONTENT (public read + admin update) ----
+// ============================================================
+// SITE CONTENT
+// ============================================================
 const DEFAULT_SITE = {
   brandName: "IPPOO ASSURANCE",
   tagline: "La micro-assurance qui prend soin de vous au Bénin",
@@ -2021,34 +1708,32 @@ const DEFAULT_SITE = {
 };
 
 app.get(`${PREFIX}/site`, async (c) => {
-  const site = (await kv.get(k.site())) ?? DEFAULT_SITE;
-  return c.json({ site: { ...DEFAULT_SITE, ...site } });
+  const { data } = await admin.from("system_config").select("value").eq("key", "system:site").maybeSingle();
+  return c.json({ site: { ...DEFAULT_SITE, ...(data?.value ?? {}) } });
 });
 
 app.put(`${PREFIX}/admin/site`, async (c) => {
   const r = await requireAdminToken(c);
-  if (!r.ok) return c.json({ error: r.error }, 401);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
     const body = await c.req.json();
-    const current = (await kv.get(k.site())) ?? DEFAULT_SITE;
-    const allow = [
-      "brandName", "tagline", "heroTitle", "heroSubtitle", "aboutShort",
-      "contactEmail", "contactPhone", "contactAddress", "whatsapp",
-      "facebook", "instagram", "linkedin",
-    ];
-    const next: Record<string, string> = { ...current };
+    const { data: current } = await admin.from("system_config").select("value").eq("key", "system:site").maybeSingle();
+    const allow = ["brandName", "tagline", "heroTitle", "heroSubtitle", "aboutShort", "contactEmail", "contactPhone", "contactAddress", "whatsapp", "facebook", "instagram", "linkedin"];
+    const next: Record<string, string> = { ...DEFAULT_SITE, ...(current?.value ?? {}) };
     for (const key of allow) {
       if (typeof body?.[key] === "string") next[key] = body[key].slice(0, 600);
     }
-    await kv.set(k.site(), next);
-    await audit(`admin:${r.admin.username}`, "admin.site.update", { count: Object.keys(body ?? {}).length });
+    await admin.from("system_config").upsert({ key: "system:site", value: next });
+    await auditLog(`admin:${r.admin.username}` as any, "admin.site.update", { count: Object.keys(body ?? {}).length });
     return c.json({ ok: true, site: next });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- PARTNERS (public read + admin CRUD) ----
+// ============================================================
+// PARTNERS
+// ============================================================
 const DEFAULT_PARTNERS = [
   { id: "p1", name: "Clinique Atinkanmey", kind: "clinique", address: "Carré 1234, Atinkanmey", city: "Cotonou", phone: "+229 21 30 12 34", lat: 6.3654, lng: 2.4183, hours: "24/7" },
   { id: "p2", name: "Pharmacie Camp Guézo", kind: "pharmacie", address: "Boulevard Saint-Michel", city: "Cotonou", phone: "+229 21 31 45 67", lat: 6.3725, lng: 2.4248, hours: "8h–22h" },
@@ -2063,13 +1748,13 @@ const DEFAULT_PARTNERS = [
 ];
 
 app.get(`${PREFIX}/partners`, async (c) => {
-  const partners = (await kv.get(k.partners())) ?? DEFAULT_PARTNERS;
-  return c.json({ partners });
+  const { data } = await admin.from("system_config").select("value").eq("key", "system:partners").maybeSingle();
+  return c.json({ partners: data?.value ?? DEFAULT_PARTNERS });
 });
 
 app.put(`${PREFIX}/admin/partners`, async (c) => {
   const r = await requireAdminToken(c);
-  if (!r.ok) return c.json({ error: r.error }, 401);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
     const body = await c.req.json();
     const raw = Array.isArray(body?.partners) ? body.partners : [];
@@ -2080,27 +1765,28 @@ app.put(`${PREFIX}/admin/partners`, async (c) => {
       address: String(p.address ?? "").slice(0, 200),
       city: String(p.city ?? "").slice(0, 80),
       phone: String(p.phone ?? "").slice(0, 40),
-      lat: Number(p.lat) || 0,
-      lng: Number(p.lng) || 0,
+      lat: Number(p.lat) || 0, lng: Number(p.lng) || 0,
       hours: String(p.hours ?? "").slice(0, 40),
     })).filter((p: any) => p.name);
-    await kv.set(k.partners(), partners);
-    await audit(`admin:${r.admin.username}`, "admin.partners.update", { count: partners.length });
+    await admin.from("system_config").upsert({ key: "system:partners", value: partners });
+    await auditLog(`admin:${r.admin.username}` as any, "admin.partners.update", { count: partners.length });
     return c.json({ ok: true, partners });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- PROMOS (public read + admin CRUD) ----
+// ============================================================
+// PROMOS
+// ============================================================
 app.get(`${PREFIX}/promos`, async (c) => {
-  const promos = (await kv.get(k.promos())) ?? [];
-  return c.json({ promos });
+  const { data } = await admin.from("system_config").select("value").eq("key", "system:promos").maybeSingle();
+  return c.json({ promos: data?.value ?? [] });
 });
 
 app.put(`${PREFIX}/admin/promos`, async (c) => {
   const r = await requireAdminToken(c);
-  if (!r.ok) return c.json({ error: r.error }, 401);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
     const body = await c.req.json();
     const raw = Array.isArray(body?.promos) ? body.promos : [];
@@ -2114,96 +1800,236 @@ app.put(`${PREFIX}/admin/promos`, async (c) => {
         to: typeof p.to === "string" ? p.to.slice(0, 200) : "",
         active: p.active !== false,
       }));
-    await kv.set(k.promos(), promos);
-    await audit(`admin:${r.admin.username}`, "admin.promos.update", { count: promos.length });
+    await admin.from("system_config").upsert({ key: "system:promos", value: promos });
+    await auditLog(`admin:${r.admin.username}` as any, "admin.promos.update", { count: promos.length });
     return c.json({ ok: true, promos });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- ADMIN: RECENT AUDIT ----
+// ============================================================
+// ADMIN: RECENT AUDIT
+// ============================================================
 app.get(`${PREFIX}/admin/audit/recent`, async (c) => {
   const r = await requireAdminToken(c);
   if (!r.admin) return c.json({ error: r.error }, r.status);
   try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "audit:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const flat: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("audit:".length);
-      const profile = (await kv.get(k.profile(uid))) ?? {};
-      for (const e of (row.value ?? []) as any[]) {
-        flat.push({ ...e, userId: uid, userEmail: profile.email ?? "", userName: profile.name ?? "" });
-      }
-    }
-    flat.sort((a, b) => (a.at < b.at ? 1 : -1));
-    return c.json({ entries: flat.slice(0, 200) });
+    const { data } = await admin.from("audit_log").select("*, profiles(email, name)").order("created_at", { ascending: false }).limit(200);
+    const entries = (data ?? []).map((e: any) => ({
+      id: e.id, action: e.action, meta: e.meta, at: e.created_at,
+      userId: e.user_id, userEmail: e.profiles?.email ?? "", userName: e.profiles?.name ?? "",
+    }));
+    return c.json({ entries });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-// ---- AUTO-DEBIT: monthly billing cycle ----
-// Iterates over all users and, for every active contract whose nextBillingDate
-// has elapsed and autoDebit is enabled, creates a pending monthly_premium
-// payment and notifies the member to pay it via KkiaPay. Idempotent — won't
-// re-create a payment for a cycle that already has one in en_attente or
-// confirme for the current month.
+// ============================================================
+// ADMIN: MESSAGES (conversations)
+// ============================================================
+app.get(`${PREFIX}/admin/messages`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const q = (c.req.query("q") ?? "").trim().toLowerCase();
+  const statusFilter = (c.req.query("status") ?? "").trim();
+  const mineOnly = c.req.query("mine") === "1";
+  try {
+    // Get all users who have messages
+    const { data: msgUsers } = await admin.from("messages").select("user_id").neq("user_id", null);
+    const uids = [...new Set((msgUsers ?? []).map((m: any) => m.user_id))];
+    const convos: any[] = [];
+    for (const uid of uids) {
+      const [{ data: msgs }, { data: profile }, { data: meta }] = await Promise.all([
+        admin.from("messages").select("*").eq("user_id", uid).order("created_at", { ascending: true }),
+        admin.from("profiles").select("email, name, member_number").eq("id", uid).maybeSingle(),
+        admin.from("conversation_meta").select("*").eq("user_id", uid).maybeSingle(),
+      ]);
+      if (!msgs?.length) continue;
+      const last = msgs[msgs.length - 1];
+      const unread = msgs.filter((m: any) => m.from_role === "user" && !m.read).length;
+      const currentMeta = meta ?? { status: "ouvert", assignee: null, tags: [] };
+      const hay = `${profile?.email ?? ""} ${profile?.name ?? ""} ${profile?.member_number ?? ""} ${last?.body ?? ""}`.toLowerCase();
+      if (q && !hay.includes(q)) continue;
+      if (statusFilter && (currentMeta.status ?? "ouvert") !== statusFilter) continue;
+      if (mineOnly && currentMeta.assignee !== r.admin.username) continue;
+      convos.push({
+        userId: uid, userEmail: profile?.email ?? "", userName: profile?.name ?? "",
+        memberNumber: profile?.member_number ?? "", lastMessage: last?.body ?? "",
+        lastAt: last?.created_at ?? "", lastFrom: last?.from_role ?? "user",
+        unread, total: msgs.length, status: currentMeta.status ?? "ouvert",
+        assignee: currentMeta.assignee ?? null, tags: currentMeta.tags ?? [],
+      });
+    }
+    convos.sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
+    return c.json({ conversations: convos });
+  } catch (err) {
+    return c.json({ error: `${err}` }, 500);
+  }
+});
+
+app.patch(`${PREFIX}/admin/messages/:uid/meta`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  try {
+    const body = await c.req.json();
+    const { data: current } = await admin.from("conversation_meta").select("*").eq("user_id", uid).maybeSingle();
+    const next: any = { user_id: uid, status: current?.status ?? "ouvert", assignee: current?.assignee ?? null, tags: current?.tags ?? [] };
+    if (body?.status && ["ouvert", "en_cours", "resolu"].includes(body.status)) next.status = body.status;
+    if (body?.assignee !== undefined) next.assignee = body.assignee ? String(body.assignee).slice(0, 80) : null;
+    if (Array.isArray(body?.tags)) next.tags = body.tags.slice(0, 8).map((t: any) => String(t).slice(0, 40));
+    next.updated_at = new Date().toISOString();
+    await admin.from("conversation_meta").upsert(next);
+    await auditLog(uid, "conversation.meta", { by: r.admin.username, ...next });
+    await broadcast(`admin:chat`, "meta:update", { userId: uid, meta: next });
+    return c.json({ meta: { status: next.status, assignee: next.assignee, tags: next.tags, updatedAt: next.updated_at } });
+  } catch (err) {
+    return c.json({ error: `${err}` }, 500);
+  }
+});
+
+app.get(`${PREFIX}/admin/messages/:uid`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  const { data: msgs } = await admin.from("messages").select("*, message_attachments(*)").eq("user_id", uid).order("created_at", { ascending: true });
+  // Mark user messages as read
+  await admin.from("messages").update({ read: true }).eq("user_id", uid).eq("from_role", "user").eq("read", false);
+  const changed = (msgs ?? []).filter((m: any) => m.from_role === "user" && !m.read).length;
+  if (changed > 0) await broadcast(`chat:${uid}`, "message:read", { count: changed, at: new Date().toISOString() });
+  return c.json({ messages: (msgs ?? []).map((m: any) => mapMessage(m, m.message_attachments?.[0])) });
+});
+
+app.post(`${PREFIX}/admin/messages/:uid`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  try {
+    const body = await c.req.json();
+    const content = String(body?.content ?? "").trim();
+    if (!content) return c.json({ error: "Message vide" }, 400);
+    const replyToId = typeof body?.replyToId === "string" ? body.replyToId : null;
+    const { data: msg } = await admin.from("messages").insert({
+      user_id: uid, from_role: "conseiller",
+      author: `${r.admin.username} (IPPOO)`, body: content, read: false, reply_to_id: replyToId,
+    }).select("*").maybeSingle();
+    await addNotification(uid, "Nouveau message conseiller", content.slice(0, 120), "info");
+    await auditLog(uid, "message.admin_reply", { by: r.admin.username, length: content.length });
+    const mapped = mapMessage(msg);
+    await Promise.all([
+      broadcast(`chat:${uid}`, "message:new", { message: mapped }),
+      broadcast(`admin:chat`, "message:new", { userId: uid, message: mapped }),
+    ]);
+    return c.json({ message: mapped });
+  } catch (err) {
+    return c.json({ error: `${err}` }, 500);
+  }
+});
+
+app.patch(`${PREFIX}/admin/messages/:uid/:id`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  const id = c.req.param("id");
+  const parsed = await parseBody(c, MessageEditSchema);
+  if (!parsed.ok) return c.json({ error: parsed.message }, parsed.status);
+  const { data: m } = await admin.from("messages").select("*").eq("id", id).eq("user_id", uid).maybeSingle();
+  if (!m) return c.json({ error: "Message introuvable" }, 404);
+  if (m.from_role !== "conseiller") return c.json({ error: "Édition refusée" }, 403);
+  if (m.deleted_at) return c.json({ error: "Message supprimé" }, 410);
+  const { data: updated } = await admin.from("messages").update({ body: parsed.data.content.trim(), edited_at: new Date().toISOString() }).eq("id", id).select("*").maybeSingle();
+  await auditLog(uid, "message.admin_edit", { by: r.admin.username, id });
+  const mapped = mapMessage(updated);
+  await Promise.all([
+    broadcast(`chat:${uid}`, "message:update", { message: mapped }),
+    broadcast(`admin:chat`, "message:update", { userId: uid, message: mapped }),
+  ]);
+  return c.json({ message: mapped });
+});
+
+app.delete(`${PREFIX}/admin/messages/:uid/:id`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  const id = c.req.param("id");
+  const { data: m } = await admin.from("messages").select("*").eq("id", id).eq("user_id", uid).maybeSingle();
+  if (!m) return c.json({ error: "Message introuvable" }, 404);
+  if (m.from_role !== "conseiller") return c.json({ error: "Suppression refusée" }, 403);
+  const { data: updated } = await admin.from("messages").update({ body: "", deleted_at: new Date().toISOString() }).eq("id", id).select("*").maybeSingle();
+  await auditLog(uid, "message.admin_delete", { by: r.admin.username, id });
+  const mapped = mapMessage(updated);
+  await Promise.all([
+    broadcast(`chat:${uid}`, "message:update", { message: mapped }),
+    broadcast(`admin:chat`, "message:update", { userId: uid, message: mapped }),
+  ]);
+  return c.json({ message: mapped });
+});
+
+app.post(`${PREFIX}/admin/messages/:uid/read`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  const { count } = await admin.from("messages").update({ read: true }).eq("user_id", uid).eq("from_role", "user").eq("read", false).select("*", { count: "exact", head: true });
+  const changed = count ?? 0;
+  if (changed > 0) await broadcast(`chat:${uid}`, "message:read", { count: changed, at: new Date().toISOString() });
+  return c.json({ ok: true, marked: changed });
+});
+
+app.post(`${PREFIX}/admin/messages/:uid/attachment`, async (c) => {
+  const r = await requireAdminToken(c);
+  if (!r.admin) return c.json({ error: r.error }, r.status);
+  const uid = c.req.param("uid");
+  try {
+    const form = await c.req.formData();
+    const file = form.get("file");
+    const caption = String(form.get("caption") ?? "").trim();
+    if (!(file instanceof File)) return c.json({ error: "Fichier manquant" }, 400);
+    if (file.size > MSG_MAX_BYTES) return c.json({ error: "Fichier trop volumineux (max 10 Mo)" }, 413);
+    if (!MSG_ALLOWED_MIME.test(file.type)) return c.json({ error: `Type non autorisé: ${file.type}` }, 415);
+    const safeName = file.name.replace(/[^\w.\-]+/g, "_").slice(-80);
+    const path = `${uid}/admin_${Date.now()}_${safeName}`;
+    const { error: upErr } = await admin.storage.from(MSG_BUCKET).upload(path, file, { contentType: file.type, upsert: false });
+    if (upErr) return c.json({ error: `Upload échoué: ${upErr.message}` }, 500);
+    const { data: msg } = await admin.from("messages").insert({
+      user_id: uid, from_role: "conseiller", author: `${r.admin.username} (IPPOO)`, body: caption, read: false,
+    }).select("*").maybeSingle();
+    await admin.from("message_attachments").insert({ message_id: msg.id, name: file.name, mime: file.type, size: file.size, path });
+    await addNotification(uid, "Nouveau message conseiller", `Pièce jointe : ${file.name}`, "info");
+    await auditLog(uid, "message.admin_attachment", { by: r.admin.username, name: file.name, size: file.size });
+    const mapped = mapMessage(msg, { name: file.name, mime: file.type, size: file.size, path });
+    await Promise.all([
+      broadcast(`chat:${uid}`, "message:new", { message: mapped }),
+      broadcast(`admin:chat`, "message:new", { userId: uid, message: mapped }),
+    ]);
+    return c.json({ message: mapped });
+  } catch (err) {
+    return c.json({ error: `${err}` }, 500);
+  }
+});
+
+// ============================================================
+// AUTO-DEBIT BILLING CYCLE
+// ============================================================
 async function runMonthlyBillingCycle(triggeredBy: string) {
-  const { data, error } = await admin
-    .from("kv_store_752d1a39")
-    .select("key, value")
-    .like("key", "contracts:%");
-  if (error) throw new Error(error.message);
+  const { data: contracts } = await admin.from("contracts").select("*, profiles(id)").eq("status", "active").eq("auto_debit", true);
   const now = new Date();
   const monthKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-  let generated = 0;
-  let skipped = 0;
-  for (const row of data ?? []) {
-    const uid = (row.key as string).slice("contracts:".length);
-    const contracts = ((row.value ?? []) as any[]).slice();
-    let changed = false;
-    const payments = ((await kv.get(k.payments(uid))) ?? []) as any[];
-    const notifs = ((await kv.get(k.notifications(uid))) ?? []) as any[];
-    for (let i = 0; i < contracts.length; i++) {
-      const ct = contracts[i];
-      if (ct.status !== "active") continue;
-      if (ct.autoDebit === false) { skipped++; continue; }
-      const due = ct.nextBillingDate ? new Date(ct.nextBillingDate).getTime() : 0;
-      if (due > now.getTime()) continue;
-      const already = payments.some((p) =>
-        p.contractId === ct.id &&
-        p.purpose === "monthly_premium" &&
-        (p.cycleKey === monthKey || (p.status === "confirme" && (p.confirmedAt ?? p.createdAt ?? "").startsWith(monthKey)))
-      );
-      if (already) { skipped++; continue; }
-      const payment = {
-        id: `p_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        contractId: ct.id,
-        amount: ct.premium,
-        currency: ct.currency ?? "XOF",
-        method: "mobile_money",
-        status: "en_attente" as const,
-        purpose: "monthly_premium" as const,
-        cycleKey: monthKey,
-        mode: Deno.env.get("KKIAPAY_PUBLIC_KEY") ? "kkiapay" : "mock",
-        createdAt: new Date().toISOString(),
-      };
-      payments.unshift(payment);
-      notify(notifs, "Cotisation mensuelle à régler", `Votre prélèvement de ${ct.premium} FCFA pour « ${ct.product} » est à régler.`, "warn");
-      contracts[i] = { ...ct, nextBillingDate: nextBillingFromNow() };
-      changed = true;
-      generated++;
-    }
-    if (changed) {
-      await kv.set(k.payments(uid), payments);
-      await kv.set(k.notifications(uid), notifs.slice(0, 200));
-      await kv.set(k.contracts(uid), contracts);
-    }
+  let generated = 0, skipped = 0;
+  for (const ct of contracts ?? []) {
+    const due = ct.next_billing_date ? new Date(ct.next_billing_date).getTime() : 0;
+    if (due > now.getTime()) { skipped++; continue; }
+    // Check if already has a pending or confirmed payment for this cycle
+    const { data: existing } = await admin.from("payments").select("id").eq("contract_id", ct.id).eq("purpose", "monthly_premium").in("status", ["confirme", "en_attente"]).gte("created_at", `${monthKey}-01`).maybeSingle();
+    if (existing) { skipped++; continue; }
+    await admin.from("payments").insert({
+      user_id: ct.user_id, contract_id: ct.id, amount: ct.premium, currency: ct.currency ?? "XOF",
+      method: "mobile_money", status: "en_attente", purpose: "monthly_premium",
+    });
+    await addNotification(ct.user_id, "Cotisation mensuelle à régler", `Votre prélèvement de ${ct.premium} FCFA pour « ${ct.product} » est à régler.`, "warn");
+    await admin.from("contracts").update({ next_billing_date: nextBillingFromNow() }).eq("id", ct.id);
+    generated++;
   }
   console.log(`[billing] cycle ${monthKey} by=${triggeredBy} generated=${generated} skipped=${skipped}`);
   return { cycleKey: monthKey, generated, skipped };
@@ -2220,8 +2046,6 @@ app.post(`${PREFIX}/admin/billing/run`, async (c) => {
   }
 });
 
-// Cron entrypoint protected by CRON_SECRET. Hook to Supabase Scheduled
-// Functions / external cron to fire on the 1st of each month at 09:00 UTC+1.
 app.post(`${PREFIX}/billing/cron`, async (c) => {
   const provided = c.req.header("X-Cron-Secret") ?? c.req.header("x-cron-secret") ?? "";
   const secret = Deno.env.get("CRON_SECRET") ?? "";
@@ -2234,152 +2058,9 @@ app.post(`${PREFIX}/billing/cron`, async (c) => {
   }
 });
 
-// ---- CONTRACT: toggle autoDebit ----
-app.patch(`${PREFIX}/contracts/:id/auto-debit`, async (c) => {
-  const { user, error } = await requireUser(c);
-  if (!user) return c.json({ error: `Non autorisé: ${error}` }, 401);
-  const id = c.req.param("id");
-  try {
-    const body = await c.req.json().catch(() => ({}));
-    const enabled = !!body?.enabled;
-    const contracts = ((await kv.get(k.contracts(user.id))) ?? []) as any[];
-    const idx = contracts.findIndex((ct: any) => ct.id === id);
-    if (idx === -1) return c.json({ error: "Contrat introuvable" }, 404);
-    contracts[idx] = { ...contracts[idx], autoDebit: enabled, nextBillingDate: enabled ? (contracts[idx].nextBillingDate ?? nextBillingFromNow()) : null };
-    await kv.set(k.contracts(user.id), contracts);
-    await audit(user.id, "contract.autoDebit", { id, enabled });
-    return c.json({ contract: contracts[idx] });
-  } catch (err) {
-    return c.json({ error: `${err}` }, 500);
-  }
-});
-
-// ---- ADMIN: MESSAGES (list conversations + reply) ----
-app.get(`${PREFIX}/admin/messages`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const q = (c.req.query("q") ?? "").trim().toLowerCase();
-  const statusFilter = (c.req.query("status") ?? "").trim();
-  const mineOnly = c.req.query("mine") === "1";
-  try {
-    const { data, error } = await admin
-      .from("kv_store_752d1a39")
-      .select("key, value")
-      .like("key", "messages:%");
-    if (error) return c.json({ error: error.message }, 500);
-    const convos: any[] = [];
-    for (const row of data ?? []) {
-      const uid = (row.key as string).slice("messages:".length);
-      const list = (row.value ?? []) as any[];
-      if (list.length === 0) continue;
-      const profile = (await kv.get(k.profile(uid))) ?? {};
-      const meta = (await kv.get(k.conversationMeta(uid))) ?? { status: "ouvert", assignee: null };
-      const last = list[list.length - 1];
-      const unread = list.filter((m) => m.from === "user" && !m.read).length;
-      const hay = `${profile.email ?? ""} ${profile.name ?? ""} ${profile.memberNumber ?? ""} ${last?.body ?? ""}`.toLowerCase();
-      if (q && !hay.includes(q)) continue;
-      if (statusFilter && (meta.status ?? "ouvert") !== statusFilter) continue;
-      if (mineOnly && meta.assignee !== r.admin.username) continue;
-      convos.push({
-        userId: uid,
-        userEmail: profile.email ?? "",
-        userName: profile.name ?? "",
-        memberNumber: profile.memberNumber ?? "",
-        lastMessage: last?.body ?? (last?.attachment ? `📎 ${last.attachment.name}` : ""),
-        lastAt: last?.createdAt ?? "",
-        lastFrom: last?.from ?? "user",
-        unread,
-        total: list.length,
-        status: meta.status ?? "ouvert",
-        assignee: meta.assignee ?? null,
-        tags: meta.tags ?? [],
-      });
-    }
-    convos.sort((a, b) => (a.lastAt < b.lastAt ? 1 : -1));
-    return c.json({ conversations: convos });
-  } catch (err) {
-    return c.json({ error: `${err}` }, 500);
-  }
-});
-
-// Update conversation meta (status / assignee / tags).
-app.patch(`${PREFIX}/admin/messages/:uid/meta`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  try {
-    const body = await c.req.json();
-    const current = (await kv.get(k.conversationMeta(uid))) ?? { status: "ouvert", assignee: null, tags: [] };
-    const next = { ...current };
-    if (body?.status && ["ouvert", "en_cours", "resolu"].includes(body.status)) next.status = body.status;
-    if (body?.assignee !== undefined) next.assignee = body.assignee ? String(body.assignee).slice(0, 80) : null;
-    if (Array.isArray(body?.tags)) next.tags = body.tags.slice(0, 8).map((t: any) => String(t).slice(0, 40));
-    next.updatedAt = new Date().toISOString();
-    await kv.set(k.conversationMeta(uid), next);
-    await audit(uid, "conversation.meta", { by: r.admin.username, ...next });
-    await broadcast(`admin:chat`, "meta:update", { userId: uid, meta: next });
-    return c.json({ meta: next });
-  } catch (err) {
-    return c.json({ error: `${err}` }, 500);
-  }
-});
-
-app.get(`${PREFIX}/admin/messages/:uid`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  const list = (await kv.get(k.messages(uid))) ?? [];
-  let changed = 0;
-  const marked = (list as any[]).map((m) => {
-    if (m.from === "user" && !m.read) { changed++; return { ...m, read: true, readAt: new Date().toISOString() }; }
-    return m;
-  });
-  if (changed > 0) {
-    await kv.set(k.messages(uid), marked);
-    await broadcast(`chat:${uid}`, "message:read", { count: changed, at: new Date().toISOString() });
-  }
-  return c.json({ messages: marked });
-});
-
-app.post(`${PREFIX}/admin/messages/:uid`, async (c) => {
-  const r = await requireAdminToken(c);
-  if (!r.admin) return c.json({ error: r.error }, r.status);
-  const uid = c.req.param("uid");
-  try {
-    const body = await c.req.json();
-    const content = String(body?.content ?? "").trim();
-    if (!content) return c.json({ error: "Message vide" }, 400);
-    const replyToId = typeof body?.replyToId === "string" ? body.replyToId : undefined;
-    const msg: any = {
-      id: `m_${Date.now()}`,
-      from: "conseiller",
-      author: `${r.admin.username} (IPPOO)`,
-      body: content,
-      createdAt: new Date().toISOString(),
-      read: false,
-    };
-    if (replyToId) msg.replyToId = replyToId;
-    const list = ((await kv.get(k.messages(uid))) ?? []) as any[];
-    list.push(msg);
-    await kv.set(k.messages(uid), list);
-    const notifs = ((await kv.get(k.notifications(uid))) ?? []) as any[];
-    await kv.set(k.notifications(uid), notify(notifs, "Nouveau message conseiller", content.slice(0, 120), "info"));
-    await audit(uid, "message.admin_reply", { by: r.admin.username, length: content.length });
-    await Promise.all([
-      broadcast(`chat:${uid}`, "message:new", { message: msg }),
-      broadcast(`admin:chat`, "message:new", { userId: uid, message: msg }),
-    ]);
-    return c.json({ message: msg });
-  } catch (err) {
-    return c.json({ error: `${err}` }, 500);
-  }
-});
-
-// === Web Push (VAPID) ===
-// Configure VAPID_PUBLIC, VAPID_PRIVATE, VAPID_SUBJECT (mailto:contact@…)
-// env vars to enable real push delivery. Without them, /push/vapid-public
-// returns null and subscribe routes still store subscriptions (so the UI
-// state stays correct), but pushUsers() will short-circuit.
+// ============================================================
+// WEB PUSH (VAPID)
+// ============================================================
 const VAPID_PUBLIC = Deno.env.get("VAPID_PUBLIC") ?? null;
 const VAPID_PRIVATE = Deno.env.get("VAPID_PRIVATE") ?? null;
 const VAPID_SUBJECT = Deno.env.get("VAPID_SUBJECT") ?? "mailto:contact@ippoo.example";
@@ -2393,9 +2074,7 @@ app.post(`${PREFIX}/push/subscribe`, async (c) => {
     const body = await c.req.json();
     const sub = body?.subscription;
     if (!sub?.endpoint) return c.json({ error: "subscription invalide" }, 400);
-    const list = ((await kv.get(k.pushSubs(r.user.id))) ?? []) as any[];
-    const next = list.filter((s) => s.endpoint !== sub.endpoint).concat([{ ...sub, createdAt: new Date().toISOString() }]);
-    await kv.set(k.pushSubs(r.user.id), next.slice(-5));
+    await admin.from("push_subscriptions").upsert({ user_id: r.user.id, endpoint: sub.endpoint, subscription: sub }, { onConflict: "endpoint" });
     return c.json({ ok: true });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
@@ -2408,15 +2087,13 @@ app.post(`${PREFIX}/push/unsubscribe`, async (c) => {
   try {
     const body = await c.req.json();
     const endpoint = String(body?.endpoint ?? "");
-    const list = ((await kv.get(k.pushSubs(r.user.id))) ?? []) as any[];
-    await kv.set(k.pushSubs(r.user.id), list.filter((s) => s.endpoint !== endpoint));
+    await admin.from("push_subscriptions").delete().eq("user_id", r.user.id).eq("endpoint", endpoint);
     return c.json({ ok: true });
   } catch (err) {
     return c.json({ error: `${err}` }, 500);
   }
 });
 
-/** Send a push notification to one or many users. No-op when VAPID env unset. */
 async function pushUsers(uids: string[], payload: { title: string; body: string; url?: string; tag?: string }) {
   if (!VAPID_PUBLIC || !VAPID_PRIVATE) return { sent: 0, skipped: uids.length, reason: "no-vapid" };
   let webpush: any;
@@ -2424,45 +2101,37 @@ async function pushUsers(uids: string[], payload: { title: string; body: string;
     webpush = await import("npm:web-push@3.6.7");
     webpush.default.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
   } catch (err) {
-    console.error("web-push import failed", err);
     return { sent: 0, skipped: uids.length, reason: "import-failed" };
   }
-  let sent = 0;
-  let failed = 0;
+  let sent = 0, failed = 0;
   for (const uid of uids) {
-    const subs = ((await kv.get(k.pushSubs(uid))) ?? []) as any[];
-    for (const s of subs) {
+    const { data: subs } = await admin.from("push_subscriptions").select("*").eq("user_id", uid);
+    for (const s of subs ?? []) {
       try {
-        await webpush.default.sendNotification(s, JSON.stringify(payload));
+        await webpush.default.sendNotification(s.subscription, JSON.stringify(payload));
         sent++;
       } catch (err: any) {
         failed++;
-        // Stale subscription — drop on 404/410
         if (err?.statusCode === 404 || err?.statusCode === 410) {
-          const cur = ((await kv.get(k.pushSubs(uid))) ?? []) as any[];
-          await kv.set(k.pushSubs(uid), cur.filter((x) => x.endpoint !== s.endpoint));
+          await admin.from("push_subscriptions").delete().eq("user_id", uid).eq("endpoint", s.endpoint);
         }
       }
     }
   }
   return { sent, failed };
 }
-// Expose for callers within this module (notify helpers etc.)
 (globalThis as any).__ippoo_pushUsers = pushUsers;
 
-// === Wallet integrations ===
-// Google Wallet — issues a signed JWT Save-to-Wallet link.
-// Requires: GOOGLE_WALLET_ISSUER_ID, GOOGLE_WALLET_CLASS_ID,
-// GOOGLE_WALLET_SA_EMAIL, GOOGLE_WALLET_SA_KEY (PEM private key).
+// ============================================================
+// WALLET (Google & Apple)
+// ============================================================
 const GW_ISSUER = Deno.env.get("GOOGLE_WALLET_ISSUER_ID") ?? null;
 const GW_CLASS = Deno.env.get("GOOGLE_WALLET_CLASS_ID") ?? null;
 const GW_SA_EMAIL = Deno.env.get("GOOGLE_WALLET_SA_EMAIL") ?? null;
 const GW_SA_KEY = Deno.env.get("GOOGLE_WALLET_SA_KEY") ?? null;
 
 async function importPemRsaKey(pem: string): Promise<CryptoKey> {
-  const body = pem.replace(/-----BEGIN PRIVATE KEY-----/, "")
-    .replace(/-----END PRIVATE KEY-----/, "")
-    .replace(/\s+/g, "");
+  const body = pem.replace(/-----BEGIN PRIVATE KEY-----/, "").replace(/-----END PRIVATE KEY-----/, "").replace(/\s+/g, "");
   const der = b64urlDecode(body.replace(/\+/g, "-").replace(/\//g, "_"));
   return crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
 }
@@ -2473,23 +2142,18 @@ app.get(`${PREFIX}/wallet/google`, async (c) => {
   const configured = !!(GW_ISSUER && GW_CLASS && GW_SA_EMAIL && GW_SA_KEY);
   if (!configured) return c.json({ saveUrl: null, configured: false });
   try {
-    const profile = (await kv.get(k.profile(r.user.id))) as any;
+    const { data: profile } = await admin.from("profiles").select("name, member_number").eq("id", r.user.id).maybeSingle();
     const objectId = `${GW_ISSUER}.member-${r.user.id}`;
     const payload = {
-      iss: GW_SA_EMAIL,
-      aud: "google",
-      typ: "savetowallet",
-      iat: Math.floor(Date.now() / 1000),
+      iss: GW_SA_EMAIL, aud: "google", typ: "savetowallet", iat: Math.floor(Date.now() / 1000),
       payload: {
         genericObjects: [{
-          id: objectId,
-          classId: GW_CLASS,
-          state: "ACTIVE",
+          id: objectId, classId: GW_CLASS, state: "ACTIVE",
           cardTitle: { defaultValue: { language: "fr", value: "IPPOO Assurance" } },
           header: { defaultValue: { language: "fr", value: profile?.name ?? "Membre IPPOO" } },
           subheader: { defaultValue: { language: "fr", value: "Carte Membre" } },
-          textModulesData: [{ header: "N° Membre", body: profile?.memberNumber ?? "—" }],
-          barcode: { type: "QR_CODE", value: profile?.memberNumber ?? r.user.id, alternateText: profile?.memberNumber ?? "" },
+          textModulesData: [{ header: "N° Membre", body: profile?.member_number ?? "—" }],
+          barcode: { type: "QR_CODE", value: profile?.member_number ?? r.user.id, alternateText: profile?.member_number ?? "" },
         }],
       },
     };
@@ -2497,31 +2161,21 @@ app.get(`${PREFIX}/wallet/google`, async (c) => {
     const h64 = b64urlEncode(enc.encode(JSON.stringify(header)));
     const p64 = b64urlEncode(enc.encode(JSON.stringify(payload)));
     const signingInput = `${h64}.${p64}`;
-    const key = await importPemRsaKey(GW_SA_KEY!);
-    const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(signingInput));
-    const jwt = `${signingInput}.${b64urlEncode(sig)}`;
-    return c.json({ saveUrl: `https://pay.google.com/gp/v/save/${jwt}`, configured: true });
+    const rsaKey = await importPemRsaKey(GW_SA_KEY!);
+    const sigBytes = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", rsaKey, enc.encode(signingInput));
+    const jwt = `${signingInput}.${b64urlEncode(sigBytes)}`;
+    const saveUrl = `https://pay.google.com/gp/v/save/${jwt}`;
+    return c.json({ saveUrl, configured: true });
   } catch (err) {
-    return c.json({ saveUrl: null, configured: true, error: `${err}` }, 500);
+    console.log(`[wallet] Google Wallet error: ${err}`);
+    return c.json({ saveUrl: null, configured: false });
   }
 });
 
-// Apple Wallet — signed .pkpass requires Apple Developer Pass Type ID cert.
-// Without APPLE_PASS_CERT + APPLE_PASS_KEY, we return 503 with a clear msg.
-app.get(`${PREFIX}/wallet/apple`, (c) => {
-  return c.json(
-    { error: "Apple Wallet non configuré (Pass Type ID requis)", configured: false },
-    503,
-  );
+app.get(`${PREFIX}/wallet/apple`, async (c) => {
+  const r = await requireUser(c);
+  if (!r.user) return c.json({ error: r.error }, 401);
+  return c.json({ message: "Apple Wallet non configuré" }, 501);
 });
 
-// Catch-all to surface unmatched paths with helpful detail (instead of bare 404)
-app.all("*", (c) => {
-  return c.json(
-    { error: `Route inconnue: ${c.req.method} ${new URL(c.req.url).pathname}` },
-    404,
-  );
-});
-
-// rev: 2026-05-26-08 (messagerie: server-side Realtime broadcast on user send + admin reply)
 Deno.serve(app.fetch);
