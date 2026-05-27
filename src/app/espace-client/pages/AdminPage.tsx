@@ -2,13 +2,13 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   Users, FileText, Wallet, RefreshCw, Search, X,
   Megaphone, History, Ban, CheckCircle2, ChevronRight, ListChecks, Image as ImageIcon, Trash2, Plus, Save, MapPin, Globe, MessageCircle, Send, Loader2,
+  Receipt, Paperclip, Reply, Pencil
 } from "lucide-react";
 import { useAdminAuth, useAdminData } from "../AdminLayout";
 import { getSupabase } from "../supabaseClient";
 import { formatDate, formatXOF } from "../hooks";
 import { api, type Claim, type AdminMember, type Promo, type Partner, type SiteContent, type Payment, type Profile } from "../api";
 import { Invoice } from "../components/Invoice";
-import { Receipt, Paperclip, Reply, Pencil, Trash2, X } from "lucide-react";
 import { AttachmentView } from "./MessageriePage";
 import { StatusBadge } from "./DashboardPage";
 import { toast } from "sonner";
