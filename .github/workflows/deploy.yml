@@ -25,3 +25,5 @@ jobs:
         run: supabase functions deploy server --project-ref fgdeeeaenffbekvgqiek
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+# Trigger deploy
