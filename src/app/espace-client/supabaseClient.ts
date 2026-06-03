@@ -1,18 +1,25 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { projectId, publicAnonKey } from "../../../utils/supabase/info";
+import { projectId, publicAnonKey, supabaseUrl } from "../../../utils/supabase/info";
 
 let client: SupabaseClient | null = null;
 
+const getUrl = () => {
+  if (typeof supabaseUrl !== "undefined" && supabaseUrl) {
+    return supabaseUrl;
+  }
+  return `https://${projectId}.supabase.co`;
+};
+
 export function getSupabase(): SupabaseClient {
   if (!client) {
-    client = createClient(`https://${projectId}.supabase.co`, publicAnonKey, {
+    client = createClient(getUrl(), publicAnonKey, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
     });
   }
   return client;
 }
 
-export const API_BASE = `https://${projectId}.supabase.co/functions/v1/make-server-752d1a39`;
+export const API_BASE = `${getUrl()}/functions/v1/make-server-752d1a39`;
 
 export async function apiFetch<T = unknown>(
   path: string,

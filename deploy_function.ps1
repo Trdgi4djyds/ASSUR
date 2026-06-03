@@ -1,28 +1,21 @@
 $token = $env:SUPABASE_ACCESS_TOKEN
 if (-not $token) {
-    Write-Host "Astuce : Vous pouvez définir la variable d'environnement SUPABASE_ACCESS_TOKEN pour éviter cette invite."
-    $token = Read-Host -Prompt "Entrez votre jeton d'accès Supabase (sbp_...)"
+    Write-Host "Astuce : Vous pouvez définir la variable d'environnement SUPABASE_ACCESS_TOKEN pour éviter cette invite (utilisez votre SERVICE_SUPABASESERVICE_KEY)."
+    $token = Read-Host -Prompt "Entrez votre jeton d'accès / clé service_role"
 }
 if (-not $token) {
-    Write-Error "Erreur : Le jeton d'accès Supabase est obligatoire."
+    Write-Error "Erreur : Le jeton/clé est obligatoire."
     exit 1
 }
-$ref = "fgdeeeaenffbekvgqiek"
-$functionName = "make-server-752d1a39"
+$ref = "selfhosted"
+$apiHost = "http://supabasekong-qwx5j3qfalx0jsygpvlj27x6.194.28.99.132.sslip.io"
+$functionName = "server"
 
-Write-Host "Deploying function '$functionName' to project '$ref' via Management API using curl.exe..."
+Write-Host "Deploying function '$functionName' to self-hosted project '$ref' via Supabase CLI..."
 
-$args = @(
-  "--request", "POST",
-  "--url", "https://api.supabase.com/v1/projects/$ref/functions/deploy?slug=$functionName",
-  "--header", "Authorization: Bearer $token",
-  "--form", 'metadata={\"entrypoint_path\": \"index.tsx\", \"name\": \"make-server-752d1a39\", \"verify_jwt\": false}',
-  "--form", "file=@supabase/functions/server/index.tsx",
-  "--fail"
-)
-
+$env:SUPABASE_ACCESS_TOKEN = $token
 try {
-    & curl.exe @args
+    supabase functions deploy $functionName --project-ref $ref --api-host $apiHost --no-verify-jwt
     Write-Host "SUCCESS!"
 } catch {
     Write-Host "FAILED!"

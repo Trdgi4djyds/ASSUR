@@ -22,7 +22,7 @@ jobs:
           version: latest
 
       - name: Deploy Server Edge Function
-        run: supabase functions deploy server --project-ref fgdeeeaenffbekvgqiek
+        run: supabase functions deploy server --project-ref selfhosted --api-host http://supabasekong-qwx5j3qfalx0jsygpvlj27x6.194.28.99.132.sslip.io
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
